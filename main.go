@@ -1,13 +1,19 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 
+	"github.com/jacquesbecker/sdex-marketmaker/balance"
 	"github.com/jacquesbecker/sdex-marketmaker/config"
 	"github.com/jacquesbecker/sdex-marketmaker/pricefeed"
+	"github.com/jacquesbecker/sdex-marketmaker/strategy"
 	"github.com/joho/godotenv"
 )
 
@@ -23,6 +29,7 @@ func main() {
 	mongoURI := getEnv("MONGO_URI", "mongodb://localhost:27017")
 	mongoDatabase := getEnv("MONGO_DATABASE", "sdex_bot")
 	configID := getEnv("CONFIG_ID", "")
+	horizonBaseURI := getEnv("HORIZON_BASE_URI", "https://horizon.stellar.org")
 
 	if configID == "" {
 		log.Fatal("CONFIG_ID environment variable is required")
@@ -48,13 +55,89 @@ func main() {
 		botConfig.PriceFeedOptions.CounterAsset,
 	)
 
-	// Initialize and start the Binance price feed
-	feed := pricefeed.NewBinanceFeed(botConfig)
-	
-	// Run price feed in a goroutine (background service)
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// WaitGroup to track running services
+	var wg sync.WaitGroup
+
+	// Initialize and start the Balance Monitor first
+	balanceMonitor := balance.NewMonitor(botConfig, horizonBaseURI)
+
+	// Run balance monitor in a goroutine (background service)
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
+		if err := balanceMonitor.Start(); err != nil {
+			log.Printf("Balance monitor error: %v", err)
+		}
+	}()
+
+	// Create balances provider function
+	balancesProvider := func() pricefeed.Balances {
+		monitor := balance.GetInstance()
+		if monitor == nil {
+			return pricefeed.Balances{Base: 0, Quote: 0, Timestamp: 0}
+		}
+
+		baseBalance, counterBalance, err := monitor.GetLatestBalances()
+		if err != nil {
+			return pricefeed.Balances{Base: 0, Quote: 0, Timestamp: 0}
+		}
+
+		// Convert string balances to float64
+		var base, quote float64
+		if _, err := fmt.Sscanf(baseBalance.Balance, "%f", &base); err != nil {
+			base = 0
+		}
+		if _, err := fmt.Sscanf(counterBalance.Balance, "%f", &quote); err != nil {
+			quote = 0
+		}
+
+		return pricefeed.Balances{
+			Base:      base,
+			Quote:     quote,
+			Timestamp: time.Now().UnixMilli(),
+		}
+	}
+
+	// Initialize Binance price feed with balances provider
+	feed := pricefeed.NewBinanceFeed(botConfig, balancesProvider)
+
+	// Run price feed in a goroutine (background service)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 		if err := feed.Start(); err != nil {
-			log.Fatalf("Price feed error: %v", err)
+			log.Printf("Price feed error: %v", err)
+		}
+	}()
+
+	// Initialize strategy engine
+	strategyConfig := strategy.NewDefaultConfig()
+	engine := strategy.NewStrategyEngine(strategyConfig, feed, botConfig)
+	log.Printf("Strategy engine initialized (volWindow=%dms, gamma=%.3f, eta=%.2f)",
+		engine.Config.VolWindowMs, engine.Config.Gamma, engine.Config.Eta)
+
+	// Run strategy computation loop
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				pBid, pAsk, ok := engine.ComputeQuotes()
+				if ok {
+					log.Printf("\n💰 [QUOTES] BID: %.6f | ASK: %.6f | Spread: %.6f (%.1fbps)\n",
+						pBid, pAsk, pAsk-pBid, ((pAsk-pBid)/((pBid+pAsk)/2))*10000)
+				}
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 
@@ -63,9 +146,35 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
-	log.Println("Shutting down...")
+	log.Println("\n[SHUTDOWN] Received shutdown signal, initiating graceful shutdown...")
+
+	// Stop services
+	log.Println("[SHUTDOWN] Stopping price feed...")
 	feed.Stop()
-	log.Println("Shutdown complete")
+
+	log.Println("[SHUTDOWN] Stopping balance monitor...")
+	balanceMonitor.Stop()
+
+	// Wait for all goroutines to finish with timeout
+	log.Println("[SHUTDOWN] Waiting for services to stop...")
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	// Wait for services to stop or timeout after 10 seconds
+	select {
+	case <-done:
+		log.Println("[SHUTDOWN] All services stopped gracefully")
+	case <-time.After(10 * time.Second):
+		log.Println("[SHUTDOWN] Timeout waiting for services to stop, forcing shutdown")
+	}
+
+	log.Println("[SHUTDOWN] Closing MongoDB connection...")
+	// MongoDB will be closed by defer
+
+	log.Println("[SHUTDOWN] Shutdown complete")
 }
 
 // getEnv retrieves an environment variable with a fallback default value
