@@ -58,8 +58,30 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 		sigma = 1e-6 // prevent division by zero
 	}
 
-	// Compute fair price r₀ (weighted average of extMid and microprice)
-	r0 := (1-s.Config.Eta)*features.ExtMid + s.Config.Eta*features.Microprice
+	// Short smoothing window for microprice/TOB/depth
+	smoothMs := s.Config.SmoothingMs
+	if smoothMs <= 0 {
+		smoothMs = 2000
+	}
+	smallWin := s.Feed.GetFeaturesWindow(smoothMs)
+
+	avg := func(get func(pricefeed.FeaturesRow) float64) float64 {
+		if len(smallWin) == 0 {
+			return get(features)
+		}
+		sum := 0.0
+		for _, r := range smallWin {
+			sum += get(r)
+		}
+		return sum / float64(len(smallWin))
+	}
+
+	// Smoothed fair price inputs
+	extMidSm := avg(func(r pricefeed.FeaturesRow) float64 { return r.ExtMid })
+	microSm := avg(func(r pricefeed.FeaturesRow) float64 { return r.Microprice })
+
+	// Compute fair price r₀ (weighted average of smoothed extMid and microprice)
+	r0 := (1-s.Config.Eta)*extMidSm + s.Config.Eta*microSm
 	if r0 <= 0 {
 		log.Printf("[STRATEGY] Invalid fair price r0=%.6f", r0)
 		return 0, 0, false
@@ -77,22 +99,78 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	// Compute reservation price (inventory-aware adjustment)
 	r := r0 - 0.5*s.Config.Gamma*sigma*sigma*V
 
-	// Compute side-specific imbalance penalties (from TOB)
-	Ibid := math.Max(0, -features.TobImbalance) // negative TOB means more asks
-	Iask := math.Max(0, features.TobImbalance)  // positive TOB means more bids
+	// Compute side-specific imbalance penalties (from smoothed TOB)
+	tobSm := avg(func(r pricefeed.FeaturesRow) float64 { return r.TobImbalance })
+	Ibid := math.Max(0, -tobSm) // negative TOB means more asks
+	Iask := math.Max(0, tobSm)  // positive TOB means more bids
+
+	// Compute depth adjustments (now relative to Delta0, not absolute)
+	// This prevents orderbook imbalance from dominating the spread
+	depthAdjustBid := s.Config.LambdaDepth * s.Config.Delta0 * Ibid
+	depthAdjustAsk := s.Config.LambdaDepth * s.Config.Delta0 * Iask
+	
+	// Cap depth adjustments to prevent extreme spreads
+	maxDepthAdj := s.Config.MaxDepthSkew * s.Config.Delta0
+	if maxDepthAdj <= 0 {
+		maxDepthAdj = 3.0 * s.Config.Delta0 // fallback: 3x base spread
+	}
+	if depthAdjustBid > maxDepthAdj {
+		depthAdjustBid = maxDepthAdj
+	}
+	if depthAdjustAsk > maxDepthAdj {
+		depthAdjustAsk = maxDepthAdj
+	}
+
+	// Inventory adjustment with optional cap in bps
+	invAdjBid := s.Config.LambdaInv * math.Max(0, V)
+	invAdjAsk := s.Config.LambdaInv * math.Max(0, -V)
+	if s.Config.MaxInvAdjBps > 0 {
+		cap := (s.Config.MaxInvAdjBps / 10000.0) * r0
+		if invAdjBid > cap {
+			invAdjBid = cap
+		}
+		if invAdjAsk > cap {
+			invAdjAsk = cap
+		}
+	}
 
 	// Compute half-spreads per side (δ_bid and δ_ask)
 	deltaBid := s.Config.Delta0 +
 		s.Config.LambdaSigma*sigma +
-		s.Config.LambdaInv*math.Max(0, V) +
-		s.Config.LambdaDepth*Ibid +
+		invAdjBid +
+		depthAdjustBid +
 		s.Config.LambdaAlpha*0 // alpha not used yet
 
 	deltaAsk := s.Config.Delta0 +
 		s.Config.LambdaSigma*sigma +
-		s.Config.LambdaInv*math.Max(0, -V) +
-		s.Config.LambdaDepth*Iask +
+		invAdjAsk +
+		depthAdjustAsk +
 		s.Config.LambdaAlpha*0 // alpha not used yet
+
+	// Soft clamp: push total spread toward target when inventory is balanced and vol is normal
+	if s.Config.TargetSpreadBps > 0 && s.Config.ClampWeight > 0 {
+		computed := deltaBid + deltaAsk
+		if computed > 0 {
+			invFac := 1.0
+			if s.Config.InvBalanceThreshold > 0 {
+				invFac = math.Max(0, 1.0 - math.Abs(V)/s.Config.InvBalanceThreshold)
+			}
+			volFac := 1.0
+			if s.Config.VolatilityThreshold > 0 {
+				volFac = math.Max(0, 1.0 - sigma/s.Config.VolatilityThreshold)
+			}
+			w := s.Config.ClampWeight * invFac * volFac
+			targetAbs := (s.Config.TargetSpreadBps / 10000.0) * r0
+			scale := (w*targetAbs + (1-w)*computed) / computed
+			// Avoid shrinking below a safety floor of 0.5*Delta0 per side
+			floor := math.Max(1e-7, 0.5*s.Config.Delta0/computed)
+			if scale < floor {
+				scale = floor
+			}
+			deltaBid *= scale
+			deltaAsk *= scale
+		}
+	}
 
 	// Final bid and ask prices
 	pBid = r - deltaBid
@@ -114,10 +192,10 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	spreadBps := (spread / r0) * 10000
 	log.Printf("\n🎯 [STRATEGY QUOTES]")
 	log.Printf("   r₀=%.6f | r=%.6f | σ=%.5f | V=%.2f EURC", r0, r, sigma, V)
-	log.Printf("   δ_bid=%.6f | δ_ask=%.6f", deltaBid, deltaAsk)
+	log.Printf("   δ_bid=%.6f (depth_adj=%.6f) | δ_ask=%.6f (depth_adj=%.6f)", deltaBid, depthAdjustBid, deltaAsk, depthAdjustAsk)
 	log.Printf("   🟢 BID: %.6f | 🔴 ASK: %.6f | Spread: %.6f (%.1f bps)", pBid, pAsk, spread, spreadBps)
 	log.Printf("   Inventory: XLM=%.2f EURC=%.2f | TOB=%.3f Depth=%.3f\n",
-		features.QBase, features.QQuote, features.TobImbalance, features.DepthImbalance)
+		features.QBase, features.QQuote, tobSm, avg(func(r pricefeed.FeaturesRow) float64 { return r.DepthImbalance }))
 
 	return pBid, pAsk, true
 }
