@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -62,19 +63,6 @@ func (ob *OrderBook) Update(bids, asks []OrderBookLevel, updateID int64) {
 	ob.LastUpdate = updateID
 }
 
-// GetSnapshot returns a copy of the current order book state
-func (ob *OrderBook) GetSnapshot() ([]OrderBookLevel, []OrderBookLevel) {
-	ob.mu.RLock()
-	defer ob.mu.RUnlock()
-	
-	bids := make([]OrderBookLevel, len(ob.Bids))
-	asks := make([]OrderBookLevel, len(ob.Asks))
-	copy(bids, ob.Bids)
-	copy(asks, ob.Asks)
-	
-	return bids, asks
-}
-
 
 // PriceData represents a single price point with timestamp
 type PriceData struct {
@@ -101,30 +89,12 @@ type OrderbookState struct {
 
 // FeaturesRow represents a compact feature vector for strategy layer
 type FeaturesRow struct {
-	Ts             int64
-	ExtBid         float64
-	ExtAsk         float64
-	ExtMid         float64
-	ObBestBid      float64
-	ObBestAsk      float64
-	ObBestBidQty   float64
-	ObBestAskQty   float64
-	Microprice     float64
-	DepthBidSum    float64
-	DepthAskSum    float64
-	TobImbalance   float64
-	DepthImbalance float64
-	MidForVol      float64
-	QBase          float64
-	QQuote         float64
-	BalanceAgeMs   int64
-}
-
-// Balances represents wallet balances with timestamp
-type Balances struct {
-	Base      float64
-	Quote     float64
-	Timestamp int64
+	Ts                   int64
+	ExternalMidPrice     float64
+	MicroPrice           float64
+	RollingVolatility    *float64 // nullable if not enough data
+	BidPenalty           float64
+	AskPenalty           float64
 }
 
 // PriceBuffer is a thread-safe circular buffer for price data
@@ -160,62 +130,6 @@ func (pb *PriceBuffer) Add(price PriceData) {
 	}
 }
 
-// GetAll returns a copy of all prices in the buffer (oldest to newest)
-func (pb *PriceBuffer) GetAll() []PriceData {
-	pb.mu.RLock()
-	defer pb.mu.RUnlock()
-	
-	if pb.count == 0 {
-		return []PriceData{}
-	}
-	
-	result := make([]PriceData, pb.count)
-	
-	// If buffer is not full yet, data is contiguous from 0 to count
-	if pb.count < pb.size {
-		copy(result, pb.data[:pb.count])
-	} else {
-		// Buffer is full, need to handle wrap-around
-		// Copy from head (oldest) to end
-		n := copy(result, pb.data[pb.head:])
-		// Copy from start to head (newest)
-		copy(result[n:], pb.data[:pb.head])
-	}
-	
-	return result
-}
-
-// GetLatest returns the most recent n prices (newest to oldest)
-func (pb *PriceBuffer) GetLatest(n int) []PriceData {
-	pb.mu.RLock()
-	defer pb.mu.RUnlock()
-	
-	if pb.count == 0 || n <= 0 {
-		return []PriceData{}
-	}
-	
-	if n > pb.count {
-		n = pb.count
-	}
-	
-	result := make([]PriceData, n)
-	
-	for i := 0; i < n; i++ {
-		// Calculate index going backwards from most recent
-		idx := (pb.head - 1 - i + pb.size) % pb.size
-		result[i] = pb.data[idx]
-	}
-	
-	return result
-}
-
-// Count returns the number of prices currently in the buffer
-func (pb *PriceBuffer) Count() int {
-	pb.mu.RLock()
-	defer pb.mu.RUnlock()
-	return pb.count
-}
-
 // OrderbookUtils provides helper functions for order book calculations
 type OrderbookUtils struct{}
 
@@ -247,81 +161,84 @@ func (OrderbookUtils) ComputeDepth(bids, asks []OrderBookLevel, depth int) (bidS
 	return
 }
 
-// ClampImbalance clamps value to [-1, 1] range
-func (OrderbookUtils) ClampImbalance(x float64) float64 {
-	if x < -1 {
-		return -1
+// Helper functions
+func max(a, b float64) float64 {
+	if a > b {
+		return a
 	}
-	if x > 1 {
-		return 1
-	}
-	return x
+	return b
+}
+
+func sqrt(x float64) float64 {
+	return math.Sqrt(x)
 }
 
 // FeatureBuilder builds feature rows from order book state and balances
-type FeatureBuilder struct{}
+type FeatureBuilder struct {
+	volWindowMs int64
+}
 
-// Build constructs a FeaturesRow from order book state and balances
-func (FeatureBuilder) Build(ob *OrderbookState, balances Balances) (FeaturesRow, bool) {
+// NewFeatureBuilder creates a new feature builder with the given volatility window
+func NewFeatureBuilder(volWindowMs int64) FeatureBuilder {
+	return FeatureBuilder{volWindowMs: volWindowMs}
+}
+
+// Build constructs a FeaturesRow from order book state and historical features buffer
+func (fb FeatureBuilder) Build(ob *OrderbookState, featuresBuffer *FeaturesBuffer) (FeaturesRow, bool) {
 	if ob == nil {
 		return FeaturesRow{}, false
 	}
 	
-	utils := OrderbookUtils{}
+	// Calculate externalMidPrice: (best bid + best ask) / 2
+	externalMidPrice := (ob.BestBid + ob.BestAsk) / 2.0
 	
-	// Derive external prices from order book
-	extBid := ob.BestBid
-	extAsk := ob.BestAsk
-	extMid := (extBid + extAsk) / 2.0
-	
-	// Compute microprice
+	// Calculate microPrice: ((best ask * size at best bid) + (best bid * size at best ask)) / (size at best bid + size at best ask)
 	denomL1 := ob.BestBidQty + ob.BestAskQty
-	var microprice float64
+	var microPrice float64
 	if denomL1 > 0 {
-		microprice = (ob.BestAsk*ob.BestBidQty + ob.BestBid*ob.BestAskQty) / denomL1
+		microPrice = (ob.BestAsk*ob.BestBidQty + ob.BestBid*ob.BestAskQty) / denomL1
 	} else {
-		microprice = extMid
+		microPrice = externalMidPrice
 	}
 	
-	// Compute TOB imbalance
-	var tobImbalance float64
+	// Calculate TOB: (size at best bid - size at best ask) / (size at best bid + size at best ask)
+	var tob float64
 	if denomL1 > 0 {
-		tobImbalance = (ob.BestBidQty - ob.BestAskQty) / denomL1
+		tob = (ob.BestBidQty - ob.BestAskQty) / denomL1
 	}
-	tobImbalance = utils.ClampImbalance(tobImbalance)
 	
-	// Compute depth imbalance
-	var depthImbalance float64
-	depthDenom := ob.DepthBidSum + ob.DepthAskSum
-	if depthDenom > 0 {
-		depthImbalance = (ob.DepthBidSum - ob.DepthAskSum) / depthDenom
-	}
-	depthImbalance = utils.ClampImbalance(depthImbalance)
+	// Calculate penalties
+	bidPenalty := max(0, -tob)  // max(0, -TOB)
+	askPenalty := max(0, tob)   // max(0, +TOB)
 	
-	// Balance age
-	balanceAgeMs := ob.Timestamp - balances.Timestamp
-	if balanceAgeMs < 0 {
-		balanceAgeMs = 0
+	// Calculate rolling volatility if we have enough data
+	var rollingVolatility *float64
+	if featuresBuffer != nil && fb.volWindowMs > 0 {
+		window := featuresBuffer.WindowSince(fb.volWindowMs)
+		if len(window) >= 2 {
+			// Compute standard deviation of externalMidPrice over the window
+			var sum, sumSq float64
+			for _, row := range window {
+				sum += row.ExternalMidPrice
+				sumSq += row.ExternalMidPrice * row.ExternalMidPrice
+			}
+			n := float64(len(window))
+			mean := sum / n
+			variance := (sumSq / n) - (mean * mean)
+			if variance > 0 {
+				stdDev := sqrt(variance)
+				rollingVolatility = &stdDev
+			}
+		}
 	}
 	
 	return FeaturesRow{
-		Ts:             ob.Timestamp,
-		ExtBid:         extBid,
-		ExtAsk:         extAsk,
-		ExtMid:         extMid,
-		ObBestBid:      ob.BestBid,
-		ObBestAsk:      ob.BestAsk,
-		ObBestBidQty:   ob.BestBidQty,
-		ObBestAskQty:   ob.BestAskQty,
-		Microprice:     microprice,
-		DepthBidSum:    ob.DepthBidSum,
-		DepthAskSum:    ob.DepthAskSum,
-		TobImbalance:   tobImbalance,
-		DepthImbalance: depthImbalance,
-		MidForVol:      extMid,
-		QBase:          balances.Base,
-		QQuote:         balances.Quote,
-		BalanceAgeMs:   balanceAgeMs,
+		Ts:                ob.Timestamp,
+		ExternalMidPrice:  externalMidPrice,
+		MicroPrice:        microPrice,
+		RollingVolatility: rollingVolatility,
+		BidPenalty:        bidPenalty,
+		AskPenalty:        askPenalty,
 	}, true
 }
 
@@ -410,11 +327,11 @@ type BinanceFeed struct {
 	LastOrderbook       *OrderbookState
 	LastAppend          int64
 	MinAppendIntervalMs int64
-	BalancesProvider    func() Balances
+	FeatureBuilder      FeatureBuilder
 }
 
 // NewBinanceFeed creates a new Binance price feed
-func NewBinanceFeed(botConfig *config.BotConfig, balancesProvider func() Balances) *BinanceFeed {
+func NewBinanceFeed(botConfig *config.BotConfig) *BinanceFeed {
 	// Convert symbol to lowercase as Binance WebSocket requires lowercase
 	symbol := strings.ToLower(botConfig.PriceFeedOptions.GetTradingSymbol())
 	
@@ -438,7 +355,7 @@ func NewBinanceFeed(botConfig *config.BotConfig, balancesProvider func() Balance
 		OrderBook:           NewOrderBook(),
 		Features:            NewFeaturesBuffer(botConfig.PriceFeedOptions.BufferLength),
 		MinAppendIntervalMs: 100,
-		BalancesProvider:    balancesProvider,
+		FeatureBuilder:      NewFeatureBuilder(botConfig.StrategyOptions.VolWindowMs),
 	}
 }
 
@@ -580,9 +497,8 @@ depthBidSum, depthAskSum := utils.ComputeDepth(bids, asks, b.config.PriceFeedOpt
 	}
 	b.LastOrderbook = obState
 	
-	// Build features
-	balances := b.BalancesProvider()
-	featureRow, ok := FeatureBuilder{}.Build(obState, balances)
+	// Build features (pass the features buffer to compute rolling volatility)
+	featureRow, ok := b.FeatureBuilder.Build(obState, b.Features)
 	if !ok {
 		return
 	}
@@ -593,9 +509,13 @@ depthBidSum, depthAskSum := utils.ComputeDepth(bids, asks, b.config.PriceFeedOpt
 		b.Features.Append(featureRow)
 		b.LastAppend = now
 		
-		log.Printf("[FEATURE APPEND] mid=%.6f bid=%.6f ask=%.6f tob=%.3f depth=%.3f",
-			featureRow.ExtMid, featureRow.ExtBid, featureRow.ExtAsk,
-			featureRow.TobImbalance, featureRow.DepthImbalance)
+		volStr := "null"
+		if featureRow.RollingVolatility != nil {
+			volStr = fmt.Sprintf("%.8f", *featureRow.RollingVolatility)
+		}
+		log.Printf("[FEATURE APPEND] extMid=%.6f microPrice=%.6f vol=%s bidPenalty=%.3f askPenalty=%.3f",
+			featureRow.ExternalMidPrice, featureRow.MicroPrice, volStr,
+			featureRow.BidPenalty, featureRow.AskPenalty)
 	}
 	
 	// Calculate mid price for legacy logging
@@ -638,16 +558,6 @@ depthBidSum, depthAskSum := utils.ComputeDepth(bids, asks, b.config.PriceFeedOpt
 // GetLatestFeatures returns the most recent feature row
 func (b *BinanceFeed) GetLatestFeatures() (FeaturesRow, bool) {
 	return b.Features.Latest()
-}
-
-// GetFeaturesWindow returns features from the last msBack milliseconds
-func (b *BinanceFeed) GetFeaturesWindow(msBack int64) []FeaturesRow {
-	return b.Features.WindowSince(msBack)
-}
-
-// GetOrderbook returns the latest order book state
-func (b *BinanceFeed) GetOrderbook() *OrderbookState {
-	return b.LastOrderbook
 }
 
 // Stop gracefully stops the price feed

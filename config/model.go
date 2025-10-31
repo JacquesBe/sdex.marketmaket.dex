@@ -38,5 +38,11 @@ type BalanceMonitorOptions struct {
 
 // StrategyOptions contains configuration for the strategy engine
 type StrategyOptions struct {
-	VolWindowMs int64 `bson:"volWindowMs"` // Volatility window in milliseconds
+	VolWindowMs              int64   `bson:"volWindowMs"`              // Volatility window in milliseconds
+	BlendWeight              float64 `bson:"blendWeight"`              // Weight for microprice in fair price calculation
+	RiskAversion             float64 `bson:"riskAversion"`             // Risk aversion parameter
+	HalfSpreadFloor          float64 `bson:"halfSpreadFloor"`          // Base half spread floor (in bps)
+	VolatilitySensitivity    float64 `bson:"volatilitySensitivity"`    // Volatility sensitivity multiplier
+	InventoryBias            float64 `bson:"inventoryBias"`            // Inventory bias coefficient
+	OBImbalanceSensitivity   float64 `bson:"obImbalanceSensitivity"`   // Order book imbalance sensitivity
 }

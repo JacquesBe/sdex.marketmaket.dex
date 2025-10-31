@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -74,36 +73,8 @@ func main() {
 		}
 	}()
 
-	// Create balances provider function
-	balancesProvider := func() pricefeed.Balances {
-		monitor := balance.GetInstance()
-		if monitor == nil {
-			return pricefeed.Balances{Base: 0, Quote: 0, Timestamp: 0}
-		}
-
-		baseBalance, counterBalance, err := monitor.GetLatestBalances()
-		if err != nil {
-			return pricefeed.Balances{Base: 0, Quote: 0, Timestamp: 0}
-		}
-
-		// Convert string balances to float64
-		var base, quote float64
-		if _, err := fmt.Sscanf(baseBalance.Balance, "%f", &base); err != nil {
-			base = 0
-		}
-		if _, err := fmt.Sscanf(counterBalance.Balance, "%f", &quote); err != nil {
-			quote = 0
-		}
-
-		return pricefeed.Balances{
-			Base:      base,
-			Quote:     quote,
-			Timestamp: time.Now().UnixMilli(),
-		}
-	}
-
-	// Initialize Binance price feed with balances provider
-	feed := pricefeed.NewBinanceFeed(botConfig, balancesProvider)
+	// Initialize Binance price feed
+	feed := pricefeed.NewBinanceFeed(botConfig)
 
 	// Run price feed in a goroutine (background service)
 	wg.Add(1)
@@ -115,10 +86,11 @@ func main() {
 	}()
 
 	// Initialize strategy engine
-	strategyConfig := strategy.NewDefaultConfig()
-	engine := strategy.NewStrategyEngine(strategyConfig, feed, botConfig)
-	log.Printf("Strategy engine initialized (volWindow=%dms, gamma=%.3f, eta=%.2f)",
-		engine.Config.VolWindowMs, engine.Config.Gamma, engine.Config.Eta)
+	engine := strategy.NewStrategyEngine(feed, botConfig)
+	log.Printf("Strategy engine initialized (volWindow=%dms, blendWeight=%.2f, riskAversion=%.3f)",
+		botConfig.StrategyOptions.VolWindowMs,
+		botConfig.StrategyOptions.BlendWeight,
+		botConfig.StrategyOptions.RiskAversion)
 
 	// Run strategy computation loop
 	wg.Add(1)
