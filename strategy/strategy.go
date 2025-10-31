@@ -64,7 +64,7 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	// Get strategy parameters from bot config
 	blendWeight := s.BotConfig.StrategyOptions.BlendWeight
 	riskAversion := s.BotConfig.StrategyOptions.RiskAversion
-	halfSpreadFloor := s.BotConfig.StrategyOptions.HalfSpreadFloor / 10000.0 // convert from bps to absolute
+	halfSpreadFloorBps := s.BotConfig.StrategyOptions.HalfSpreadFloor // in basis points
 	volatilitySensitivity := s.BotConfig.StrategyOptions.VolatilitySensitivity
 	inventoryBias := s.BotConfig.StrategyOptions.InventoryBias
 	obImbalanceSensitivity := s.BotConfig.StrategyOptions.OBImbalanceSensitivity
@@ -82,21 +82,24 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	// 3. Calculate inventory bias: 0.5 * (riskAversion * rollingVolatility^2) * inventoryValue
 	inventoryBiasValue := 0.5 * (riskAversion * rollingVol * rollingVol) * inventoryValue
 
-	// 4. Calculate half spread for bid:
+	// 4. Convert halfSpreadFloor from bps to price using externalMidPrice
+	halfSpreadFloor := (halfSpreadFloorBps / 10000.0) * features.ExternalMidPrice
+
+	// 5. Calculate half spread for bid:
 	//    halfSpreadFloor + volatilitySensitivity * rollingVolatility + inventoryBias * max(0, inventoryValue) + obImbalanceSensitivity * bidPenalty
 	halfSpreadBid := halfSpreadFloor +
 		volatilitySensitivity*rollingVol +
 		inventoryBias*math.Max(0, inventoryValue) +
 		obImbalanceSensitivity*features.BidPenalty
 
-	// 5. Calculate half spread for ask:
+	// 6. Calculate half spread for ask:
 	//    halfSpreadFloor + volatilitySensitivity * rollingVolatility + inventoryBias * max(0, -inventoryValue) + obImbalanceSensitivity * askPenalty
 	halfSpreadAsk := halfSpreadFloor +
 		volatilitySensitivity*rollingVol +
 		inventoryBias*math.Max(0, -inventoryValue) +
 		obImbalanceSensitivity*features.AskPenalty
 
-	// 6. Calculate final bid and ask prices
+	// 7. Calculate final bid and ask prices
 	pBid = fairPrice - inventoryBiasValue - halfSpreadBid
 	pAsk = fairPrice - inventoryBiasValue + halfSpreadAsk
 
@@ -111,18 +114,34 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 		return 0, 0, false
 	}
 
-	// Log computed quotes
+	// Calculate spreads and metrics for logging
 	spread := pAsk - pBid
 	spreadBps := (spread / fairPrice) * 10000
 	halfSpreadBidBps := (halfSpreadBid / fairPrice) * 10000
 	halfSpreadAskBps := (halfSpreadAsk / fairPrice) * 10000
+	
+	// Calculate bid and ask spread from external mid price in basis points
+	bidSpreadFromExtMid := features.ExternalMidPrice - pBid
+	bidSpreadFromExtMidBps := (bidSpreadFromExtMid / features.ExternalMidPrice) * 10000
+	askSpreadFromExtMid := pAsk - features.ExternalMidPrice
+	askSpreadFromExtMidBps := (askSpreadFromExtMid / features.ExternalMidPrice) * 10000
 
-	log.Printf("\n🎯 [STRATEGY QUOTES]")
-	log.Printf("   FairPrice=%.6f | σ=%.8f | InvValue=%.2f | InvBias=%.6f", fairPrice, rollingVol, inventoryValue, inventoryBiasValue)
-	log.Printf("   HalfSpread: Bid=%.6f (%.1f bps) | Ask=%.6f (%.1f bps)", halfSpreadBid, halfSpreadBidBps, halfSpreadAsk, halfSpreadAskBps)
-	log.Printf("   🟢 BID: %.6f | 🔴 ASK: %.6f | Spread: %.6f (%.1f bps)", pBid, pAsk, spread, spreadBps)
-	log.Printf("   Inventory: XLM=%.2f EURC=%.2f | BidPenalty=%.3f AskPenalty=%.3f\n",
-		qBase, qQuote, features.BidPenalty, features.AskPenalty)
+	// Row 1: Input metrics
+	log.Printf("\n💰 [STRATEGY INVOCATION]")
+	log.Printf("   ExtMidPrice: %.6f | MicroPrice: %.6f | RollingVolatility: %.8f", 
+		features.ExternalMidPrice, features.MicroPrice, rollingVol)
+	log.Printf("   InventoryValue: %.4f | BidPenalty: %.4f | AskPenalty: %.4f", 
+		inventoryValue, features.BidPenalty, features.AskPenalty)
+	
+	// Row 2: Calculated intermediate values
+	log.Printf("   FairPrice: %.6f | InventoryBias: %.6f", fairPrice, inventoryBiasValue)
+	log.Printf("   HalfSpreadBid: %.6f (%.2f bps) | HalfSpreadAsk: %.6f (%.2f bps)", 
+		halfSpreadBid, halfSpreadBidBps, halfSpreadAsk, halfSpreadAskBps)
+	
+	// Row 3: Final quotes with spreads from external mid
+	log.Printf("   🟢 BID: %.6f (%.2f bps from extMid) | 🔴 ASK: %.6f (%.2f bps from extMid)", 
+		pBid, bidSpreadFromExtMidBps, pAsk, askSpreadFromExtMidBps)
+	log.Printf("   Total Spread: %.6f (%.2f bps)\n", spread, spreadBps)
 
 	return pBid, pAsk, true
 }

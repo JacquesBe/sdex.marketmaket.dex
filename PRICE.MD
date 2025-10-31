@@ -139,7 +139,43 @@ inventoryBiasValue = 0.5 * (riskAversion * rollingVolatility * rollingVolatility
 
 ---
 
-### 4. Half Spread Bid Calculation
+### 4. Half Spread Floor Conversion
+
+```
+halfSpreadFloor = (halfSpreadFloorBps / 10000.0) * externalMidPrice
+```
+
+**Components:**
+
+- **`halfSpreadFloorBps`**: Configuration value in basis points
+  - **Source**: `s.BotConfig.StrategyOptions.HalfSpreadFloor`
+  - **Location**: `strategy/strategy.go:67`
+  - **Database field**: `strategyOptions.halfSpreadFloor`
+  - **Type**: float64 (basis points)
+
+- **`externalMidPrice`**: As calculated in section 1
+  - **Value**: `(bestBid + bestAsk) / 2.0` from Binance
+
+- **`10000.0`**: Conversion factor from basis points to decimal fraction
+
+**Purpose:** Converts the basis points configuration value into an absolute price value that scales with the external mid price. This means the half spread floor adjusts proportionally to the price level.
+
+**Example:**
+```
+If halfSpreadFloorBps = 5.0 bps
+   externalMidPrice = 0.123456
+
+Then:
+halfSpreadFloor = (5.0 / 10000.0) * 0.123456
+                = 0.0005 * 0.123456
+                = 0.0000617280
+```
+
+**Location**: `strategy/strategy.go:86`
+
+---
+
+### 5. Half Spread Bid Calculation
 
 ```
 halfSpreadBid = halfSpreadFloor + volatilitySensitivity * rollingVolatility + inventoryBias * max(0, inventoryValue) + obImbalanceSensitivity * bidPenalty
@@ -147,12 +183,7 @@ halfSpreadBid = halfSpreadFloor + volatilitySensitivity * rollingVolatility + in
 
 **Components:**
 
-- **`halfSpreadFloor`**: Minimum base half-spread
-  - **Source**: `s.BotConfig.StrategyOptions.HalfSpreadFloor / 10000.0`
-  - **Location**: `strategy/strategy.go:67`
-  - **Database field**: `strategyOptions.halfSpreadFloor` (stored in basis points)
-  - **Conversion**: Divided by 10,000 to convert from bps to absolute decimal
-  - **Example**: If stored as 5.0 bps, then `halfSpreadFloor = 5.0 / 10000.0 = 0.0005`
+- **`halfSpreadFloor`**: As calculated in section 4
 
 - **`volatilitySensitivity`**: Multiplier for volatility-based spread widening
   - **Source**: `s.BotConfig.StrategyOptions.VolatilitySensitivity`
@@ -180,7 +211,7 @@ halfSpreadBid = halfSpreadFloor + volatilitySensitivity * rollingVolatility + in
 
 - **`bidPenalty`**: Penalty term for bid side based on order book imbalance
   - **Source**: `features.BidPenalty`
-  - **Location**: `strategy/strategy.go:90`
+  - **Location**: `strategy/strategy.go:93`
   - **Calculation**: `max(0, -tob)`
   - **Calculation location**: `pricefeed/binance_feed.go:291`
   - **Where `tob` is calculated**:
@@ -194,11 +225,13 @@ halfSpreadBid = halfSpreadFloor + volatilitySensitivity * rollingVolatility + in
   - **Purpose**: Ranges from -1 (ask-heavy) to +1 (bid-heavy)
   - **bidPenalty interpretation**: When TOB is negative (more size on ask side), bidPenalty is positive, widening our bid spread
 
+**Location**: `strategy/strategy.go:90-93`
+
 **Purpose:** Determines the distance between fair price and bid quote, accounting for base spread, volatility, inventory position, and order book dynamics.
 
 ---
 
-### 5. Half Spread Ask Calculation
+### 6. Half Spread Ask Calculation
 
 ```
 halfSpreadAsk = halfSpreadFloor + volatilitySensitivity * rollingVolatility + inventoryBias * max(0, -inventoryValue) + obImbalanceSensitivity * askPenalty
@@ -206,34 +239,36 @@ halfSpreadAsk = halfSpreadFloor + volatilitySensitivity * rollingVolatility + in
 
 **Components:**
 
-- **`halfSpreadFloor`**: As described in section 4
+- **`halfSpreadFloor`**: As calculated in section 4
 
-- **`volatilitySensitivity`**: As described in section 4
+- **`volatilitySensitivity`**: As described in section 5
 
 - **`rollingVolatility`**: As described in section 3
 
-- **`inventoryBias`**: As described in section 4
+- **`inventoryBias`**: As described in section 5
 
 - **`max(0, -inventoryValue)`**: Maximum of 0 and negative inventoryValue
   - **Purpose**: Only applies penalty when we have negative inventory (short position)
   - **Formula**: If `inventoryValue < 0` then use `-inventoryValue`, else use `0`
   - **Note**: This is the opposite of the bid calculation
 
-- **`obImbalanceSensitivity`**: As described in section 4
+- **`obImbalanceSensitivity`**: As described in section 5
 
 - **`askPenalty`**: Penalty term for ask side based on order book imbalance
   - **Source**: `features.AskPenalty`
-  - **Location**: `strategy/strategy.go:97`
+  - **Location**: `strategy/strategy.go:100`
   - **Calculation**: `max(0, tob)`
   - **Calculation location**: `pricefeed/binance_feed.go:292`
-  - **Where `tob` is calculated**: Same as in section 4
+  - **Where `tob` is calculated**: Same as in section 5
   - **askPenalty interpretation**: When TOB is positive (more size on bid side), askPenalty is positive, widening our ask spread
+
+**Location**: `strategy/strategy.go:97-100`
 
 **Purpose:** Determines the distance between fair price and ask quote, with inventory bias applied to the opposite side compared to bid.
 
 ---
 
-### 6. Final Bid Price Calculation
+### 7. Final Bid Price Calculation
 
 ```
 pBid = fairPrice - inventoryBiasValue - halfSpreadBid
@@ -243,9 +278,9 @@ pBid = fairPrice - inventoryBiasValue - halfSpreadBid
 
 - **`fairPrice`**: As calculated in section 1
 - **`inventoryBiasValue`**: As calculated in section 3
-- **`halfSpreadBid`**: As calculated in section 4
+- **`halfSpreadBid`**: As calculated in section 5
 
-**Location**: `strategy/strategy.go:100`
+**Location**: `strategy/strategy.go:103`
 
 **Breakdown:**
 1. Start with fair price
@@ -264,7 +299,7 @@ pBid = 0.123457 - 0.000010 - 0.000050
 
 ---
 
-### 7. Final Ask Price Calculation
+### 8. Final Ask Price Calculation
 
 ```
 pAsk = fairPrice - inventoryBiasValue + halfSpreadAsk
@@ -274,9 +309,9 @@ pAsk = fairPrice - inventoryBiasValue + halfSpreadAsk
 
 - **`fairPrice`**: As calculated in section 1
 - **`inventoryBiasValue`**: As calculated in section 3
-- **`halfSpreadAsk`**: As calculated in section 5
+- **`halfSpreadAsk`**: As calculated in section 6
 
-**Location**: `strategy/strategy.go:101`
+**Location**: `strategy/strategy.go:104`
 
 **Breakdown:**
 1. Start with fair price
@@ -341,9 +376,11 @@ Strategy Engine: Compute Inventory Value (strategy.go:80)
     ↓
 Strategy Engine: Compute Inventory Bias (strategy.go:83)
     ↓
-Strategy Engine: Compute Half Spreads (strategy.go:87-97)
+Strategy Engine: Convert Half Spread Floor (strategy.go:86)
     ↓
-Strategy Engine: Compute Final Quotes (strategy.go:100-101)
+Strategy Engine: Compute Half Spreads (strategy.go:90-100)
+    ↓
+Strategy Engine: Compute Final Quotes (strategy.go:103-104)
     ↓
 Output: pBid, pAsk
 ```
@@ -358,7 +395,7 @@ All strategy parameters are stored in MongoDB and loaded at startup:
 |-----------|---------------|------|------------------|---------|
 | `blendWeight` | `strategyOptions.blendWeight` | float64 | `strategy.go:65` | Weight for microprice vs external mid |
 | `riskAversion` | `strategyOptions.riskAversion` | float64 | `strategy.go:66` | Inventory risk aversion (γ) |
-| `halfSpreadFloor` | `strategyOptions.halfSpreadFloor` | float64 | `strategy.go:67` | Minimum half-spread in bps |
+| `halfSpreadFloorBps` | `strategyOptions.halfSpreadFloor` | float64 | `strategy.go:67` | Minimum half-spread in bps |
 | `volatilitySensitivity` | `strategyOptions.volatilitySensitivity` | float64 | `strategy.go:68` | Volatility spread multiplier |
 | `inventoryBias` | `strategyOptions.inventoryBias` | float64 | `strategy.go:69` | Inventory asymmetry coefficient |
 | `obImbalanceSensitivity` | `strategyOptions.obImbalanceSensitivity` | float64 | `strategy.go:70` | Order book imbalance sensitivity |
@@ -368,7 +405,7 @@ All strategy parameters are stored in MongoDB and loaded at startup:
 
 ## Validation Checks
 
-Before returning quotes, the following sanity checks are performed (`strategy/strategy.go:104-112`):
+Before returning quotes, the following sanity checks are performed (`strategy/strategy.go:107-115`):
 
 1. **Positive Price Check**:
    ```
@@ -394,20 +431,21 @@ Combining all sections, here is the complete unsimplified formula:
 ```
 pBid = [(1 - blendWeight) * ((bestBid + bestAsk) / 2) + blendWeight * ((bestAsk * bestBidQty + bestBid * bestAskQty) / (bestBidQty + bestAskQty))]
        - [0.5 * riskAversion * rollingVolatility² * (qBase * fairPrice - qQuote)]
-       - [halfSpreadFloor / 10000 + volatilitySensitivity * rollingVolatility + inventoryBias * max(0, qBase * fairPrice - qQuote) + obImbalanceSensitivity * max(0, -(bestBidQty - bestAskQty) / (bestBidQty + bestAskQty))]
+       - [(halfSpreadFloorBps / 10000) * externalMidPrice + volatilitySensitivity * rollingVolatility + inventoryBias * max(0, qBase * fairPrice - qQuote) + obImbalanceSensitivity * max(0, -(bestBidQty - bestAskQty) / (bestBidQty + bestAskQty))]
 ```
 
 ### Ask Price:
 ```
 pAsk = [(1 - blendWeight) * ((bestBid + bestAsk) / 2) + blendWeight * ((bestAsk * bestBidQty + bestBid * bestAskQty) / (bestBidQty + bestAskQty))]
        - [0.5 * riskAversion * rollingVolatility² * (qBase * fairPrice - qQuote)]
-       + [halfSpreadFloor / 10000 + volatilitySensitivity * rollingVolatility + inventoryBias * max(0, -(qBase * fairPrice - qQuote)) + obImbalanceSensitivity * max(0, (bestBidQty - bestAskQty) / (bestBidQty + bestAskQty))]
+       + [(halfSpreadFloorBps / 10000) * externalMidPrice + volatilitySensitivity * rollingVolatility + inventoryBias * max(0, -(qBase * fairPrice - qQuote)) + obImbalanceSensitivity * max(0, (bestBidQty - bestAskQty) / (bestBidQty + bestAskQty))]
 ```
 
 Where:
 - `bestBid`, `bestAsk`, `bestBidQty`, `bestAskQty` come from Binance WebSocket
+- `externalMidPrice` is `(bestBid + bestAsk) / 2` from Binance
 - `qBase`, `qQuote` come from Horizon API
-- `blendWeight`, `riskAversion`, `halfSpreadFloor`, `volatilitySensitivity`, `inventoryBias`, `obImbalanceSensitivity` come from MongoDB config
+- `blendWeight`, `riskAversion`, `halfSpreadFloorBps`, `volatilitySensitivity`, `inventoryBias`, `obImbalanceSensitivity` come from MongoDB config
 - `rollingVolatility` is calculated from historical `externalMidPrice` over `volWindowMs` window
 - `fairPrice` is the first bracketed expression (used in inventory calculations)
 
@@ -416,7 +454,8 @@ Where:
 ## Notes
 
 - All prices are in decimal format (not basis points) in calculations
-- The `halfSpreadFloor` is converted from bps to decimal by dividing by 10,000
+- The `halfSpreadFloorBps` is converted from bps to an absolute price by: `(halfSpreadFloorBps / 10000) * externalMidPrice`
+- This means the half spread floor scales with the price level (e.g., 5 bps of a 0.10 price = 0.00005, but 5 bps of a 1.00 price = 0.0005)
 - Rolling volatility requires at least 2 data points in the window to be calculated
 - Feature rows are appended to the buffer with a minimum interval of 100ms (`MinAppendIntervalMs`)
 - Balance monitoring and price feed updates run independently in separate goroutines

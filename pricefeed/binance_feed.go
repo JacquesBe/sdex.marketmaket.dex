@@ -509,13 +509,14 @@ depthBidSum, depthAskSum := utils.ComputeDepth(bids, asks, b.config.PriceFeedOpt
 		b.Features.Append(featureRow)
 		b.LastAppend = now
 		
+		// Log every feature row calculation
 		volStr := "null"
 		if featureRow.RollingVolatility != nil {
 			volStr = fmt.Sprintf("%.8f", *featureRow.RollingVolatility)
 		}
-		log.Printf("[FEATURE APPEND] extMid=%.6f microPrice=%.6f vol=%s bidPenalty=%.3f askPenalty=%.3f",
-			featureRow.ExternalMidPrice, featureRow.MicroPrice, volStr,
-			featureRow.BidPenalty, featureRow.AskPenalty)
+		log.Printf("\n📈 [FEATURE ROW CALCULATED]")
+		log.Printf("   ExternalMidPrice: %.6f | MicroPrice: %.6f", featureRow.ExternalMidPrice, featureRow.MicroPrice)
+		log.Printf("   RollingVolatility: %s | BidPenalty: %.4f | AskPenalty: %.4f\n", volStr, featureRow.BidPenalty, featureRow.AskPenalty)
 	}
 	
 	// Calculate mid price for legacy logging
