@@ -3,7 +3,6 @@ package strategy
 import (
 	"fmt"
 	"log"
-	"math"
 
 	"github.com/jacquesbecker/sdex-marketmaker/balance"
 	"github.com/jacquesbecker/sdex-marketmaker/config"
@@ -63,11 +62,9 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 
 	// Get strategy parameters from bot config
 	blendWeight := s.BotConfig.StrategyOptions.BlendWeight
-	riskAversion := s.BotConfig.StrategyOptions.RiskAversion
 	halfSpreadFloorBps := s.BotConfig.StrategyOptions.HalfSpreadFloor // in basis points
 	volatilitySensitivity := s.BotConfig.StrategyOptions.VolatilitySensitivity
 	inventoryBias := s.BotConfig.StrategyOptions.InventoryBias
-	obImbalanceSensitivity := s.BotConfig.StrategyOptions.OBImbalanceSensitivity
 
 	// 1. Calculate fair price: (1 - blendWeight) * externalMidPrice + blendWeight * microprice
 	fairPrice := (1-blendWeight)*features.ExternalMidPrice + blendWeight*features.MicroPrice
@@ -76,49 +73,45 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 		return 0, 0, false
 	}
 
-	// 2. Calculate inventory value: baseAssetQuantity * fairPrice - counterAssetQuantity
-	inventoryValue := qBase*fairPrice - qQuote
+	// 2. Calculate relative inventory: (qBase * ExtMid) / ((qBase * ExtMid) + qQuote) - 0.5
+	// Range: [-0.5, 0.5] where 0 = balanced
+	baseValue := qBase * features.ExternalMidPrice
+	totalValue := baseValue + qQuote
+	var relativeInventory float64
+	if totalValue > 0 {
+		relativeInventory = (baseValue / totalValue) - 0.5
+	}
+	
+	// Log inventory calculation details
+	log.Printf("[INVENTORY] qBase=%.4f, qQuote=%.4f, ExtMid=%.6f", qBase, qQuote, features.ExternalMidPrice)
+	log.Printf("[INVENTORY] baseValue=%.4f, totalValue=%.4f", baseValue, totalValue)
+	log.Printf("[INVENTORY] relativeInventory=%.6f (%.2f%%)", relativeInventory, relativeInventory*100)
 
-	// 3. Calculate inventory bias: 0.5 * (riskAversion * rollingVolatility^2) * inventoryValue
-	inventoryBiasValue := 0.5 * (riskAversion * rollingVol * rollingVol) * inventoryValue
-
-	// 4. Convert halfSpreadFloor from bps to price using externalMidPrice
+	// 3. Convert halfSpreadFloor from bps to price
 	halfSpreadFloor := (halfSpreadFloorBps / 10000.0) * features.ExternalMidPrice
-
-	// 5. Calculate half spread for bid:
-	//    halfSpreadFloor + volatilitySensitivity * rollingVolatility + inventoryBias * max(0, inventoryValue) + obImbalanceSensitivity * bidPenalty
-	halfSpreadBid := halfSpreadFloor +
-		volatilitySensitivity*rollingVol +
-		inventoryBias*math.Max(0, inventoryValue) +
-		obImbalanceSensitivity*features.BidPenalty
-
-	// 6. Calculate half spread for ask:
-	//    halfSpreadFloor + volatilitySensitivity * rollingVolatility + inventoryBias * max(0, -inventoryValue) + obImbalanceSensitivity * askPenalty
-	halfSpreadAsk := halfSpreadFloor +
-		volatilitySensitivity*rollingVol +
-		inventoryBias*math.Max(0, -inventoryValue) +
-		obImbalanceSensitivity*features.AskPenalty
+	
+	// 4. Calculate volatility component (already in price units)
+	volComponent := volatilitySensitivity * rollingVol
+	
+	// 5. Calculate inventory component (multiply relative inventory by ExtMid)
+	invComponent := inventoryBias * relativeInventory * features.ExternalMidPrice
+	
+	// Log inventory adjustment calculation
+	log.Printf("[INVENTORY ADJ] relativeInventory=%.6f | relInv*ExtMid=%.8f | inventoryBias=%.6f", 
+		relativeInventory, relativeInventory*features.ExternalMidPrice, inventoryBias)
+	log.Printf("[INVENTORY ADJ] Total invComponent = %.8f EURC", invComponent)
+	
+	// 6. Calculate half spread: floor + vol + inv (all in price units)
+	halfSpread := halfSpreadFloor + volComponent + invComponent
 
 	// 7. Calculate final bid and ask prices
-	pBid = fairPrice - inventoryBiasValue - halfSpreadBid
-	pAsk = fairPrice - inventoryBiasValue + halfSpreadAsk
+	pBid = fairPrice - halfSpread
+	pAsk = fairPrice + halfSpread
 
-	// Sanity checks
-	if pBid <= 0 || pAsk <= 0 {
-		log.Printf("[STRATEGY] Invalid prices: pBid=%.6f pAsk=%.6f", pBid, pAsk)
-		return 0, 0, false
-	}
-
-	if pBid >= pAsk {
-		log.Printf("[STRATEGY] Crossed quotes: pBid=%.6f >= pAsk=%.6f", pBid, pAsk)
-		return 0, 0, false
-	}
-
-	// Calculate spreads and metrics for logging
+	// Calculate spreads and metrics for logging (before sanity checks so we always see the breakdown)
 	spread := pAsk - pBid
 	spreadBps := (spread / fairPrice) * 10000
-	halfSpreadBidBps := (halfSpreadBid / fairPrice) * 10000
-	halfSpreadAskBps := (halfSpreadAsk / fairPrice) * 10000
+	halfSpreadBps := (halfSpread / fairPrice) * 10000
 	
 	// Calculate bid and ask spread from external mid price in basis points
 	bidSpreadFromExtMid := features.ExternalMidPrice - pBid
@@ -128,20 +121,34 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 
 	// Row 1: Input metrics
 	log.Printf("\n💰 [STRATEGY INVOCATION]")
-	log.Printf("   ExtMidPrice: %.6f | MicroPrice: %.6f | RollingVolatility: %.8f", 
+	log.Printf("   ExtMidPrice: %.6f | MicroPrice: %.6f | AbsoluteVol: %.8f", 
 		features.ExternalMidPrice, features.MicroPrice, rollingVol)
-	log.Printf("   InventoryValue: %.4f | BidPenalty: %.4f | AskPenalty: %.4f", 
-		inventoryValue, features.BidPenalty, features.AskPenalty)
+	log.Printf("   RelativeInventory: %.6f (%.1f%%)", relativeInventory, relativeInventory*100)
 	
 	// Row 2: Calculated intermediate values
-	log.Printf("   FairPrice: %.6f | InventoryBias: %.6f", fairPrice, inventoryBiasValue)
-	log.Printf("   HalfSpreadBid: %.6f (%.2f bps) | HalfSpreadAsk: %.6f (%.2f bps)", 
-		halfSpreadBid, halfSpreadBidBps, halfSpreadAsk, halfSpreadAskBps)
+	log.Printf("   FairPrice: %.6f | InventoryBias: %.6f", fairPrice, inventoryBias)
+	
+	// Detailed breakdown of half spread components
+	log.Printf("   📊 [HALF SPREAD BREAKDOWN]")
+	log.Printf("      Floor: %.6f (%.2f bps) | Vol: %.6f | Inv: %.6f",
+		halfSpreadFloor, halfSpreadFloorBps, volComponent, invComponent)
+	log.Printf("      Total HalfSpread: %.6f (%.2f bps)", halfSpread, halfSpreadBps)
 	
 	// Row 3: Final quotes with spreads from external mid
 	log.Printf("   🟢 BID: %.6f (%.2f bps from extMid) | 🔴 ASK: %.6f (%.2f bps from extMid)", 
 		pBid, bidSpreadFromExtMidBps, pAsk, askSpreadFromExtMidBps)
 	log.Printf("   Total Spread: %.6f (%.2f bps)\n", spread, spreadBps)
+
+	// Sanity checks
+	if pBid <= 0 || pAsk <= 0 {
+		log.Printf("❌ [STRATEGY ERROR] Invalid prices: pBid=%.6f pAsk=%.6f\n", pBid, pAsk)
+		return 0, 0, false
+	}
+
+	if pBid >= pAsk {
+		log.Printf("❌ [STRATEGY ERROR] Crossed quotes: pBid=%.6f >= pAsk=%.6f\n", pBid, pAsk)
+		return 0, 0, false
+	}
 
 	return pBid, pAsk, true
 }

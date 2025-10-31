@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"log"
 	"os"
 	"os/signal"
@@ -54,24 +53,8 @@ func main() {
 		botConfig.PriceFeedOptions.CounterAsset,
 	)
 
-	// Create context for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	// WaitGroup to track running services
 	var wg sync.WaitGroup
-
-	// Initialize and start the Balance Monitor first
-	balanceMonitor := balance.NewMonitor(botConfig, horizonBaseURI)
-
-	// Run balance monitor in a goroutine (background service)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := balanceMonitor.Start(); err != nil {
-			log.Printf("Balance monitor error: %v", err)
-		}
-	}()
 
 	// Initialize Binance price feed
 	feed := pricefeed.NewBinanceFeed(botConfig)
@@ -92,24 +75,26 @@ func main() {
 		botConfig.StrategyOptions.BlendWeight,
 		botConfig.StrategyOptions.RiskAversion)
 
-	// Run strategy computation loop
+	// Initialize and start the Balance Monitor
+	balanceMonitor := balance.NewMonitor(botConfig, horizonBaseURI)
+	
+	// Set callback to invoke strategy when balances are updated
+balanceMonitor.SetBalanceUpdateCallback(func() {
+		log.Printf("[STRATEGY] Invoking ComputeQuotes...")
+		pBid, pAsk, ok := engine.ComputeQuotes()
+		log.Printf("[STRATEGY] ComputeQuotes ok=%v", ok)
+		if ok {
+			log.Printf("\n💰 [QUOTES] BID: %.6f | ASK: %.6f | Spread: %.6f (%.1fbps)\n",
+				pBid, pAsk, pAsk-pBid, ((pAsk-pBid)/((pBid+pAsk)/2))*10000)
+		}
+	})
+	
+	// Run balance monitor in a goroutine (background service)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				pBid, pAsk, ok := engine.ComputeQuotes()
-				if ok {
-					log.Printf("\n💰 [QUOTES] BID: %.6f | ASK: %.6f | Spread: %.6f (%.1fbps)\n",
-						pBid, pAsk, pAsk-pBid, ((pAsk-pBid)/((pBid+pAsk)/2))*10000)
-				}
-			case <-ctx.Done():
-				return
-			}
+		if err := balanceMonitor.Start(); err != nil {
+			log.Printf("Balance monitor error: %v", err)
 		}
 	}()
 

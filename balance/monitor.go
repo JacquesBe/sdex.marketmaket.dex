@@ -39,6 +39,9 @@ type AssetBalance struct {
 	Limit              string
 }
 
+// BalanceUpdateCallback is a function type that gets called when balances are updated
+type BalanceUpdateCallback func()
+
 // Monitor manages the balance monitoring service
 type Monitor struct {
 	config         *config.BotConfig
@@ -48,6 +51,9 @@ type Monitor struct {
 	mu             sync.RWMutex
 	baseBalance    *AssetBalance
 	counterBalance *AssetBalance
+	onUpdate       BalanceUpdateCallback
+	lastUpdateAt   int64 // unix ms of last successful balance fetch
+	logCounter     int
 }
 
 var (
@@ -85,14 +91,15 @@ func (m *Monitor) Start() error {
 	ticker := time.NewTicker(tickRate)
 	defer ticker.Stop()
 
-	// Fetch balances immediately on start
+	// Fetch balances immediately on start (do not exit on error)
 	if err := m.fetchBalances(); err != nil {
 		log.Printf("Initial balance fetch error: %v", err)
 	}
 
 	for {
 		select {
-		case <-ticker.C:
+		case t := <-ticker.C:
+			log.Printf("[BALANCE TICK] %s", t.Format(time.RFC3339))
 			if err := m.fetchBalances(); err != nil {
 				log.Printf("Balance fetch error: %v", err)
 			}
@@ -126,17 +133,23 @@ func (m *Monitor) fetchBalances() error {
 	// Update cached balances
 	m.updateBalances(&accountData)
 
+	// Update last successful time
+	m.lastUpdateAt = time.Now().UnixMilli()
+
 	// Log the balances
 	m.logBalances(&accountData)
 	
 	return nil
 }
 
+// SetBalanceUpdateCallback sets the callback function to be called when balances are updated
+func (m *Monitor) SetBalanceUpdateCallback(callback BalanceUpdateCallback) {
+	m.onUpdate = callback
+}
+
 // updateBalances updates the cached balances for base and counter assets
 func (m *Monitor) updateBalances(account *HorizonAccountResponse) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	for _, balance := range account.Balances {
 		// Check if this is the base asset
 		if m.isBaseAsset(balance) {
@@ -157,6 +170,13 @@ func (m *Monitor) updateBalances(account *HorizonAccountResponse) {
 				Limit:              balance.Limit,
 			}
 		}
+	}
+	m.mu.Unlock()
+	
+	// Trigger callback AFTER releasing the lock to avoid deadlock
+	if m.onUpdate != nil {
+		log.Printf("[BALANCE CALLBACK] invoking strategy update")
+		m.onUpdate()
 	}
 }
 
@@ -191,20 +211,7 @@ func (m *Monitor) GetLatestBalances() (*AssetBalance, *AssetBalance, error) {
 
 // logBalances logs the current account balances
 func (m *Monitor) logBalances(account *HorizonAccountResponse) {
-	// Only log every 10th fetch to reduce noise
-	static := struct {
-		mu      sync.Mutex
-		counter int
-	}{}
-	static.mu.Lock()
-	static.counter++
-	shouldLog := static.counter == 1 || static.counter%10 == 0
-	static.mu.Unlock()
-	
-	if !shouldLog {
-		return
-	}
-	
+	// Log every fetch
 	log.Printf("\n💳 [BALANCES]")
 	for _, balance := range account.Balances {
 		if balance.AssetType == "native" {
@@ -219,4 +226,9 @@ func (m *Monitor) logBalances(account *HorizonAccountResponse) {
 func (m *Monitor) Stop() {
 	log.Println("Stopping Balance Monitor...")
 	close(m.stopChan)
+}
+
+// GetLastUpdateAt returns the last successful balance fetch time (unix ms)
+func (m *Monitor) GetLastUpdateAt() int64 {
+	return m.lastUpdateAt
 }

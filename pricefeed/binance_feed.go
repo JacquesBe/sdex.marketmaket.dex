@@ -211,7 +211,7 @@ func (fb FeatureBuilder) Build(ob *OrderbookState, featuresBuffer *FeaturesBuffe
 	bidPenalty := max(0, -tob)  // max(0, -TOB)
 	askPenalty := max(0, tob)   // max(0, +TOB)
 	
-	// Calculate rolling volatility if we have enough data
+	// Calculate rolling volatility (absolute) - standard deviation of external mid price
 	var rollingVolatility *float64
 	if featuresBuffer != nil && fb.volWindowMs > 0 {
 		window := featuresBuffer.WindowSince(fb.volWindowMs)
@@ -225,10 +225,12 @@ func (fb FeatureBuilder) Build(ob *OrderbookState, featuresBuffer *FeaturesBuffe
 			n := float64(len(window))
 			mean := sum / n
 			variance := (sumSq / n) - (mean * mean)
+			stdDev := 0.0
 			if variance > 0 {
-				stdDev := sqrt(variance)
-				rollingVolatility = &stdDev
+				stdDev = sqrt(variance)
 			}
+			// Absolute volatility in price units
+			rollingVolatility = &stdDev
 		}
 	}
 	
@@ -328,6 +330,8 @@ type BinanceFeed struct {
 	LastAppend          int64
 	MinAppendIntervalMs int64
 	FeatureBuilder      FeatureBuilder
+	LastMessageAt       int64 // unix ms of last WS message read
+	obLogCounter        int
 }
 
 // NewBinanceFeed creates a new Binance price feed
@@ -366,18 +370,16 @@ func (b *BinanceFeed) Start() error {
 
 	for b.reconnect {
 		if err := b.connect(); err != nil {
-			log.Printf("Connection error: %v. Reconnecting in 5 seconds...", err)
+			log.Printf("[BINANCE WS] Connection error: %v. Reconnecting in 5s...", err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
 
-		// Listen for messages
-		b.readMessages()
-
-		// If we get here, connection was closed
-		if b.reconnect {
-			log.Println("Connection closed. Reconnecting in 5 seconds...")
+		// Listen for messages (blocking); on error, log and reconnect without killing the program
+		if err := b.readMessages(); err != nil {
+			log.Printf("[BINANCE WS] Read loop error: %v. Reconnecting in 5s...", err)
 			time.Sleep(5 * time.Second)
+			continue
 		}
 	}
 
@@ -397,16 +399,19 @@ func (b *BinanceFeed) connect() error {
 }
 
 // readMessages continuously reads and processes messages from the WebSocket
-func (b *BinanceFeed) readMessages() {
+// It returns an error only if the underlying connection errors; it will not proactively close the WS.
+func (b *BinanceFeed) readMessages() error {
 	defer b.conn.Close()
 
 	msgCount := 0
 	for {
 		_, message, err := b.conn.ReadMessage()
 		if err != nil {
-			log.Printf("[BINANCE WS] Error reading message: %v", err)
-			return
+			return fmt.Errorf("read message failed: %w", err)
 		}
+
+		// mark last message time
+		b.LastMessageAt = time.Now().UnixMilli()
 
 		msgCount++
 		if msgCount <= 3 {
@@ -503,20 +508,16 @@ depthBidSum, depthAskSum := utils.ComputeDepth(bids, asks, b.config.PriceFeedOpt
 		return
 	}
 	
-	// Throttle feature appends
-	now := time.Now().UnixMilli()
-	if now-b.LastAppend >= b.MinAppendIntervalMs {
-		b.Features.Append(featureRow)
-		b.LastAppend = now
-		
-		// Log every feature row calculation
-		volStr := "null"
-		if featureRow.RollingVolatility != nil {
-			volStr = fmt.Sprintf("%.8f", *featureRow.RollingVolatility)
-		}
-		log.Printf("\n📈 [FEATURE ROW CALCULATED]")
-		log.Printf("   ExternalMidPrice: %.6f | MicroPrice: %.6f", featureRow.ExternalMidPrice, featureRow.MicroPrice)
-		log.Printf("   RollingVolatility: %s | BidPenalty: %.4f | AskPenalty: %.4f\n", volStr, featureRow.BidPenalty, featureRow.AskPenalty)
+	// Append feature on every orderbook update (no throttling)
+	b.Features.Append(featureRow)
+	
+	// Debug: log feature buffer status
+	b.Features.mu.RLock()
+	count := b.Features.count
+	b.Features.mu.RUnlock()
+	
+	if count <= 5 {
+		log.Printf("[FEATURES] Appended feature row. Buffer count: %d. RollingVol: %v", count, featureRow.RollingVolatility)
 	}
 	
 	// Calculate mid price for legacy logging
@@ -532,22 +533,14 @@ depthBidSum, depthAskSum := utils.ComputeDepth(bids, asks, b.config.PriceFeedOpt
 	}
 	b.PriceBuffer.Add(priceData)
 
-	// Simplified logging - only log every 10th update to reduce noise
-	static := struct {
-		mu      sync.Mutex
-		counter int
-	}{}
-	static.mu.Lock()
-	static.counter++
-	shouldLog := static.counter%10 == 0
-	static.mu.Unlock()
-	
-	if shouldLog {
+	// Log every 10th order book update
+	b.obLogCounter++
+	if b.obLogCounter%10 == 0 {
 		spread := bestAsk - bestBid
 		spreadBps := (spread / midPrice) * 10000
 		depthImb := (depthBidSum - depthAskSum) / (depthBidSum + depthAskSum)
 		tobImb := (bestBidQty - bestAskQty) / (bestBidQty + bestAskQty)
-		
+
 		log.Printf("\n📊 [ORDER BOOK] %s", depth.Symbol)
 		log.Printf("   Mid: %.6f | Spread: %.6f (%.1f bps)", midPrice, spread, spreadBps)
 		log.Printf("   L1: Bid %.6f@%.0f | Ask %.6f@%.0f", bestBid, bestBidQty, bestAsk, bestAskQty)
@@ -559,6 +552,11 @@ depthBidSum, depthAskSum := utils.ComputeDepth(bids, asks, b.config.PriceFeedOpt
 // GetLatestFeatures returns the most recent feature row
 func (b *BinanceFeed) GetLatestFeatures() (FeaturesRow, bool) {
 	return b.Features.Latest()
+}
+
+// GetLastMessageAt returns the last time a WS message was received (unix ms)
+func (b *BinanceFeed) GetLastMessageAt() int64 {
+	return b.LastMessageAt
 }
 
 // Stop gracefully stops the price feed
