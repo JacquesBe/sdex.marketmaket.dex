@@ -7,6 +7,7 @@ import "go.mongodb.org/mongo-driver/bson/primitive"
 type BotConfig struct {
 	ID                    primitive.ObjectID     `bson:"_id"`
 	PublicKey             string                 `bson:"publicKey"`
+	SecretKey             string                 `bson:"secretKey"`
 	BaseAsset             string                 `bson:"baseAsset"`
 	CounterAsset          string                 `bson:"counterAsset"`
 	BaseAssetIssuer       string                 `bson:"baseAssetIssuer"`
@@ -14,6 +15,7 @@ type BotConfig struct {
 	PriceFeedOptions      PriceFeedOptions       `bson:"priceFeedOptions"`
 	BalanceMonitorOptions BalanceMonitorOptions  `bson:"balanceMonitorOptions"`
 	StrategyOptions       StrategyOptions        `bson:"strategyOptions"`
+	OfferManagerOptions   OfferManagerOptions    `bson:"offerManagerOptions"`
 }
 
 // PriceFeedOptions contains configuration for the price feed source (CEX)
@@ -45,4 +47,13 @@ type StrategyOptions struct {
 	VolatilitySensitivity    float64 `bson:"volatilitySensitivity"`    // Volatility sensitivity multiplier
 	InventoryBias            float64 `bson:"inventoryBias"`            // Inventory bias coefficient
 	OBImbalanceSensitivity   float64 `bson:"obImbalanceSensitivity"`   // Order book imbalance sensitivity
+}
+
+// OfferManagerOptions contains configuration for the offer manager service
+type OfferManagerOptions struct {
+	OfferMonitorTickRate     int     `bson:"offerMonitorTickRate"`     // Tick rate in milliseconds
+	OfferQuantity            float64 `bson:"offerQuantity"`            // Amount per offer in base asset units
+	PriceGraceBasisPoints    float64 `bson:"priceGraceBasisPoints"`    // Price tolerance in basis points
+	OfferGraceQuantity       float64 `bson:"offerGraceQuantity"`       // Quantity tolerance in base asset units
+	FeeMaxStroops            int64   `bson:"feeMaxStroops"`            // Maximum transaction fee in stroops
 }

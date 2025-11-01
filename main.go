@@ -10,6 +10,7 @@ import (
 
 	"github.com/jacquesbecker/sdex-marketmaker/balance"
 	"github.com/jacquesbecker/sdex-marketmaker/config"
+	"github.com/jacquesbecker/sdex-marketmaker/offers"
 	"github.com/jacquesbecker/sdex-marketmaker/pricefeed"
 	"github.com/jacquesbecker/sdex-marketmaker/strategy"
 	"github.com/joho/godotenv"
@@ -28,6 +29,7 @@ func main() {
 	mongoDatabase := getEnv("MONGO_DATABASE", "sdex_bot")
 	configID := getEnv("CONFIG_ID", "")
 	horizonBaseURI := getEnv("HORIZON_BASE_URI", "https://horizon.stellar.org")
+	networkPassphrase := getEnv("NETWORK_PASSPHRASE", "Public Global Stellar Network ; September 2015")
 
 	if configID == "" {
 		log.Fatal("CONFIG_ID environment variable is required")
@@ -68,6 +70,21 @@ func main() {
 		}
 	}()
 
+	// Initialize offer monitor
+	offerMonitor := offers.NewMonitor(botConfig, horizonBaseURI)
+
+	// Initialize offer manager
+	offerManager, err := offers.NewManager(botConfig, horizonBaseURI, networkPassphrase, offerMonitor)
+	if err != nil {
+		log.Fatalf("Failed to initialize offer manager: %v", err)
+	}
+
+	// Cancel all existing offers on startup
+	log.Println("[STARTUP] Cancelling all existing offers...")
+	if err := offerManager.CancelAllOffers(); err != nil {
+		log.Printf("[STARTUP] Warning: Failed to cancel offers: %v", err)
+	}
+
 	// Initialize strategy engine
 	engine := strategy.NewStrategyEngine(feed, botConfig)
 	log.Printf("Strategy engine initialized (volWindow=%dms, blendWeight=%.2f, riskAversion=%.3f)",
@@ -98,6 +115,42 @@ balanceMonitor.SetBalanceUpdateCallback(func() {
 		}
 	}()
 
+	// Run offer monitor in a goroutine (background service)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := offerMonitor.Start(); err != nil {
+			log.Printf("Offer monitor error: %v", err)
+		}
+	}()
+
+	// Price feed watchdog - shuts down bot if feed dies
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Println("[WATCHDOG] Price feed watchdog started (30s timeout)")
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				lastMsg := feed.GetLastMessageAt()
+				if lastMsg == 0 {
+					// Still initializing
+					continue
+				}
+				elapsed := time.Now().UnixMilli() - lastMsg
+				if elapsed > 30000 { // 30 seconds
+					log.Printf("\n\u274c [WATCHDOG] CRITICAL: Price feed died! Last message %dms ago. Shutting down...", elapsed)
+					// Send shutdown signal
+					syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
+					return
+				}
+			}
+		}
+	}()
+
 	// Wait for interrupt signal to gracefully shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -105,12 +158,21 @@ balanceMonitor.SetBalanceUpdateCallback(func() {
 
 	log.Println("\n[SHUTDOWN] Received shutdown signal, initiating graceful shutdown...")
 
+	// Cancel all offers first
+	log.Println("[SHUTDOWN] Cancelling all offers...")
+	if err := offerManager.CancelAllOffers(); err != nil {
+		log.Printf("[SHUTDOWN] Warning: Failed to cancel offers: %v", err)
+	}
+
 	// Stop services
 	log.Println("[SHUTDOWN] Stopping price feed...")
 	feed.Stop()
 
 	log.Println("[SHUTDOWN] Stopping balance monitor...")
 	balanceMonitor.Stop()
+
+	log.Println("[SHUTDOWN] Stopping offer monitor...")
+	offerMonitor.Stop()
 
 	// Wait for all goroutines to finish with timeout
 	log.Println("[SHUTDOWN] Waiting for services to stop...")
