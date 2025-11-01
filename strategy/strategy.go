@@ -93,25 +93,30 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	// 4. Calculate volatility component (already in price units)
 	volComponent := volatilitySensitivity * rollingVol
 	
-	// 5. Calculate inventory component (multiply relative inventory by ExtMid)
-	invComponent := inventoryBias * relativeInventory * features.ExternalMidPrice
+	// 5. Calculate asymmetric inventory adjustment
+	// When long XLM (relativeInventory > 0): widen bid to discourage buying more
+	// When short XLM (relativeInventory < 0): widen ask to discourage selling more
+	invComponentBid := inventoryBias * max(0, relativeInventory) * features.ExternalMidPrice
+	invComponentAsk := inventoryBias * max(0, -relativeInventory) * features.ExternalMidPrice
 	
 	// Log inventory adjustment calculation
-	log.Printf("[INVENTORY ADJ] relativeInventory=%.6f | relInv*ExtMid=%.8f | inventoryBias=%.6f", 
-		relativeInventory, relativeInventory*features.ExternalMidPrice, inventoryBias)
-	log.Printf("[INVENTORY ADJ] Total invComponent = %.8f EURC", invComponent)
+	log.Printf("[INVENTORY ADJ] relativeInventory=%.6f | inventoryBias=%.6f", 
+		relativeInventory, inventoryBias)
+	log.Printf("[INVENTORY ADJ] invComponentBid=%.8f | invComponentAsk=%.8f", invComponentBid, invComponentAsk)
 	
-	// 6. Calculate half spread: floor + vol + inv (all in price units)
-	halfSpread := halfSpreadFloor + volComponent + invComponent
+	// 6. Calculate half spreads asymmetrically
+	halfSpreadBid := halfSpreadFloor + volComponent + invComponentBid
+	halfSpreadAsk := halfSpreadFloor + volComponent + invComponentAsk
 
 	// 7. Calculate final bid and ask prices
-	pBid = fairPrice - halfSpread
-	pAsk = fairPrice + halfSpread
+	pBid = fairPrice - halfSpreadBid
+	pAsk = fairPrice + halfSpreadAsk
 
 	// Calculate spreads and metrics for logging (before sanity checks so we always see the breakdown)
 	spread := pAsk - pBid
 	spreadBps := (spread / fairPrice) * 10000
-	halfSpreadBps := (halfSpread / fairPrice) * 10000
+	halfSpreadBidBps := (halfSpreadBid / fairPrice) * 10000
+	halfSpreadAskBps := (halfSpreadAsk / fairPrice) * 10000
 	
 	// Calculate bid and ask spread from external mid price in basis points
 	bidSpreadFromExtMid := features.ExternalMidPrice - pBid
@@ -128,11 +133,12 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	// Row 2: Calculated intermediate values
 	log.Printf("   FairPrice: %.6f | InventoryBias: %.6f", fairPrice, inventoryBias)
 	
-	// Detailed breakdown of half spread components
+	// Detailed breakdown of half spread components (asymmetric)
 	log.Printf("   📊 [HALF SPREAD BREAKDOWN]")
-	log.Printf("      Floor: %.6f (%.2f bps) | Vol: %.6f | Inv: %.6f",
-		halfSpreadFloor, halfSpreadFloorBps, volComponent, invComponent)
-	log.Printf("      Total HalfSpread: %.6f (%.2f bps)", halfSpread, halfSpreadBps)
+	log.Printf("      Floor: %.6f (%.2f bps) | Vol: %.6f",
+		halfSpreadFloor, halfSpreadFloorBps, volComponent)
+	log.Printf("      BID HalfSpread: %.6f (%.2f bps) | ASK HalfSpread: %.6f (%.2f bps)",
+		halfSpreadBid, halfSpreadBidBps, halfSpreadAsk, halfSpreadAskBps)
 	
 	// Row 3: Final quotes with spreads from external mid
 	log.Printf("   🟢 BID: %.6f (%.2f bps from extMid) | 🔴 ASK: %.6f (%.2f bps from extMid)", 
