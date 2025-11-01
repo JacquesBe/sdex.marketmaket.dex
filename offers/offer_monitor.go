@@ -154,16 +154,26 @@ func (m *Monitor) reconcileOffers(horizonOffers []HorizonOffer) {
 		// Determine offer type
 		offerType := m.determineOfferType(&hOffer)
 
-		// Normalize price (bids have inverted price in Horizon)
+		// Normalize price and quantity
 		normalizedPrice := hOffer.Price
-		normalizedQuantity := hOffer.Amount // Amount is already in base asset for both bid and ask
+		normalizedQuantity := hOffer.Amount
 		
 		if offerType == OfferTypeBid {
-			// For ManageBuyOffer, Horizon price is EURC/XLM, we want XLM/EURC
+			// For ManageBuyOffer (bid):
+			// - Horizon price is EURC/XLM, we want XLM/EURC
+			// - Horizon amount is in COUNTER asset (EURC), we need BASE asset (XLM)
 			if horizonPrice, err := strconv.ParseFloat(hOffer.Price, 64); err == nil && horizonPrice > 0 {
 				normalizedPrice = fmt.Sprintf("%.7f", 1.0/horizonPrice)
+				
+				// Convert counter asset amount to base asset amount
+				// amount_counter / price_counter_per_base = amount_base
+				if counterAmt, err := strconv.ParseFloat(hOffer.Amount, 64); err == nil {
+					baseAmt := counterAmt / horizonPrice
+					normalizedQuantity = fmt.Sprintf("%.7f", baseAmt)
+				}
 			}
 		}
+		// For ManageSellOffer (ask): amount is already in base asset, no conversion needed
 
 		// Check if this offer already exists in our hashmap
 		if existingOffer, exists := m.offers[hOffer.ID]; exists {
@@ -260,6 +270,18 @@ func (m *Monitor) GetOffers() map[string]*Offer {
 		}
 	}
 	return offersCopy
+}
+
+// ForceRefresh fetches offers immediately (synchronously)
+func (m *Monitor) ForceRefresh() error {
+	log.Println("[OFFER MONITOR] Forcing immediate refresh...")
+	return m.fetchAndReconcileOffers()
+}
+
+// ForceRefresh immediately fetches and reconciles offers (synchronous)
+func (m *Monitor) ForceRefresh() error {
+	log.Println("[OFFER MONITOR] Forcing immediate refresh...")
+	return m.fetchAndReconcileOffers()
 }
 
 // Stop gracefully stops the offer monitor

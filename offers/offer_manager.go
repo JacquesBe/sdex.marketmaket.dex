@@ -93,14 +93,41 @@ func (m *Manager) ExecuteOffers(bidPrice, askPrice float64) error {
 	// Log current state
 	m.logCurrentOffers(currentOffers)
 
-	// Find current bid and ask offers
+	// Find current bid and ask offers, detect multiples
 	var currentBid, currentAsk *Offer
+	var allBids, allAsks []*Offer
 	for _, offer := range currentOffers {
 		if offer.Type == OfferTypeBid {
-			currentBid = offer
+			allBids = append(allBids, offer)
+			currentBid = offer // Pick last one for now
 		} else if offer.Type == OfferTypeAsk {
-			currentAsk = offer
+			allAsks = append(allAsks, offer)
+			currentAsk = offer // Pick last one for now
 		}
+	}
+
+	// If multiple offers per side exist, cancel extras first
+	if len(allBids) > 1 {
+		log.Printf("⚠️  [OFFER MANAGER] WARNING: Found %d BID offers (expected 1). Cancelling extras...", len(allBids))
+		if err := m.cancelExtraOffers(allBids); err != nil {
+			log.Printf("[OFFER MANAGER] Error cancelling extra bids: %v", err)
+		}
+		// Force monitor refresh after cancellation
+		if err := m.monitor.ForceRefresh(); err != nil {
+			log.Printf("[OFFER MANAGER] Error refreshing monitor: %v", err)
+		}
+		return fmt.Errorf("multiple bid offers detected, cancelled extras - retry on next tick")
+	}
+	if len(allAsks) > 1 {
+		log.Printf("⚠️  [OFFER MANAGER] WARNING: Found %d ASK offers (expected 1). Cancelling extras...", len(allAsks))
+		if err := m.cancelExtraOffers(allAsks); err != nil {
+			log.Printf("[OFFER MANAGER] Error cancelling extra asks: %v", err)
+		}
+		// Force monitor refresh after cancellation
+		if err := m.monitor.ForceRefresh(); err != nil {
+			log.Printf("[OFFER MANAGER] Error refreshing monitor: %v", err)
+		}
+		return fmt.Errorf("multiple ask offers detected, cancelled extras - retry on next tick")
 	}
 
 	// Build list of offers to submit
@@ -284,6 +311,12 @@ func (m *Manager) submitOffers(offers []OfferToSubmit, retryCount int) error {
 	}
 
 	log.Printf("[OFFER MANAGER] ✅ Offers submitted successfully (tx hash: %s)", resp.Hash)
+	
+	// Force monitor to refresh immediately to sync hashmap with new on-chain state
+	if err := m.monitor.ForceRefresh(); err != nil {
+		log.Printf("[OFFER MANAGER] Warning: Failed to refresh monitor after submission: %v", err)
+	}
+	
 	return nil
 }
 
@@ -427,6 +460,12 @@ func (m *Manager) CancelAllOffers() error {
 	}
 
 	log.Printf("[OFFER MANAGER] ✅ All offers cancelled successfully (tx hash: %s)", resp2.Hash)
+	
+	// Force monitor to refresh immediately to clear hashmap
+	if err := m.monitor.ForceRefresh(); err != nil {
+		log.Printf("[OFFER MANAGER] Warning: Failed to refresh monitor after cancellation: %v", err)
+	}
+	
 	return nil
 }
 
