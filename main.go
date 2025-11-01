@@ -14,6 +14,7 @@ import (
 	"github.com/jacquesbecker/sdex-marketmaker/pricefeed"
 	"github.com/jacquesbecker/sdex-marketmaker/strategy"
 	"github.com/joho/godotenv"
+	"github.com/stellar/go/network"
 )
 
 func main() {
@@ -29,7 +30,6 @@ func main() {
 	mongoDatabase := getEnv("MONGO_DATABASE", "sdex_bot")
 	configID := getEnv("CONFIG_ID", "")
 	horizonBaseURI := getEnv("HORIZON_BASE_URI", "https://horizon.stellar.org")
-	networkPassphrase := getEnv("NETWORK_PASSPHRASE", "Public Global Stellar Network ; September 2015")
 
 	if configID == "" {
 		log.Fatal("CONFIG_ID environment variable is required")
@@ -54,6 +54,16 @@ func main() {
 		botConfig.PriceFeedOptions.BaseAsset,
 		botConfig.PriceFeedOptions.CounterAsset,
 	)
+
+	// Determine network passphrase from Horizon URL
+	var networkPassphrase string
+	if horizonBaseURI == "https://horizon-testnet.stellar.org" {
+		networkPassphrase = network.TestNetworkPassphrase
+		log.Println("Using TESTNET network")
+	} else {
+		networkPassphrase = network.PublicNetworkPassphrase
+		log.Println("Using MAINNET (public) network")
+	}
 
 	// WaitGroup to track running services
 	var wg sync.WaitGroup
@@ -95,6 +105,9 @@ func main() {
 	// Initialize and start the Balance Monitor
 	balanceMonitor := balance.NewMonitor(botConfig, horizonBaseURI)
 	
+	// Track startup time for 30-second warmup
+	startupTime := time.Now()
+	
 	// Set callback to invoke strategy when balances are updated
 balanceMonitor.SetBalanceUpdateCallback(func() {
 		log.Printf("[STRATEGY] Invoking ComputeQuotes...")
@@ -103,6 +116,19 @@ balanceMonitor.SetBalanceUpdateCallback(func() {
 		if ok {
 			log.Printf("\n💰 [QUOTES] BID: %.6f | ASK: %.6f | Spread: %.6f (%.1fbps)\n",
 				pBid, pAsk, pAsk-pBid, ((pAsk-pBid)/((pBid+pAsk)/2))*10000)
+			
+			// Check if warmup period has passed (30 seconds)
+			elapsed := time.Since(startupTime).Seconds()
+			if elapsed < 30 {
+				log.Printf("[STRATEGY] Warmup period: %.0fs elapsed, waiting for 30s before executing offers...", elapsed)
+				return
+			}
+			
+			// Execute offers
+			log.Printf("[STRATEGY] Executing offers...")
+			if err := offerManager.ExecuteOffers(pBid, pAsk); err != nil {
+				log.Printf("[STRATEGY] Error executing offers: %v", err)
+			}
 		}
 	})
 	
@@ -158,13 +184,7 @@ balanceMonitor.SetBalanceUpdateCallback(func() {
 
 	log.Println("\n[SHUTDOWN] Received shutdown signal, initiating graceful shutdown...")
 
-	// Cancel all offers first
-	log.Println("[SHUTDOWN] Cancelling all offers...")
-	if err := offerManager.CancelAllOffers(); err != nil {
-		log.Printf("[SHUTDOWN] Warning: Failed to cancel offers: %v", err)
-	}
-
-	// Stop services
+	// Stop services FIRST (so they don't interfere with offer cancellation)
 	log.Println("[SHUTDOWN] Stopping price feed...")
 	feed.Stop()
 
@@ -182,12 +202,20 @@ balanceMonitor.SetBalanceUpdateCallback(func() {
 		close(done)
 	}()
 
-	// Wait for services to stop or timeout after 10 seconds
+	// Wait for services to stop or timeout after 5 seconds
 	select {
 	case <-done:
 		log.Println("[SHUTDOWN] All services stopped gracefully")
-	case <-time.After(10 * time.Second):
-		log.Println("[SHUTDOWN] Timeout waiting for services to stop, forcing shutdown")
+	case <-time.After(5 * time.Second):
+		log.Println("[SHUTDOWN] Timeout waiting for services to stop, continuing...")
+	}
+
+	// NOW cancel all offers (after services are stopped)
+	log.Println("[SHUTDOWN] Cancelling all offers...")
+	if err := offerManager.CancelAllOffers(); err != nil {
+		log.Printf("[SHUTDOWN] Warning: Failed to cancel offers: %v", err)
+	} else {
+		log.Println("[SHUTDOWN] All offers cancelled successfully")
 	}
 
 	log.Println("[SHUTDOWN] Closing MongoDB connection...")

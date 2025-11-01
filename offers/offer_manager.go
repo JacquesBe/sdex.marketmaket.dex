@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/jacquesbecker/sdex-marketmaker/config"
 	"github.com/stellar/go/clients/horizonclient"
@@ -34,6 +36,7 @@ type Offer struct {
 type Manager struct {
 	config         *config.BotConfig
 	horizonClient  *horizonclient.Client
+	httpClient     *http.Client
 	sourcekeypair  *keypair.Full
 	networkPass    string
 	monitor        *Monitor
@@ -52,17 +55,29 @@ func NewManager(botConfig *config.BotConfig, horizonBaseURI string, networkPassp
 		HorizonURL: horizonBaseURI,
 	}
 
+	// Create HTTP client
+	httpClient := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
 	return &Manager{
 		config:         botConfig,
 		horizonClient:  client,
+		httpClient:     httpClient,
 		sourcekeypair:  kp,
 		networkPass:    networkPassphrase,
 		monitor:        monitor,
 	}, nil
 }
 
+// OfferToSubmit represents an offer operation to submit
+type OfferToSubmit struct {
+	OfferID int64
+	Price   float64
+	Type    OfferType
+}
+
 // ExecuteOffers evaluates current offers and submits/updates as needed
-// bidPrice and askPrice are the new prices calculated by the strategy
 func (m *Manager) ExecuteOffers(bidPrice, askPrice float64) error {
 	// Sanity check prices
 	if bidPrice <= 0 || askPrice <= 0 {
@@ -88,21 +103,44 @@ func (m *Manager) ExecuteOffers(bidPrice, askPrice float64) error {
 		}
 	}
 
-	// Evaluate and execute bid side
-	if err := m.evaluateAndExecute(currentBid, bidPrice, OfferTypeBid); err != nil {
-		log.Printf("[OFFER MANAGER] Error executing bid: %v", err)
+	// Build list of offers to submit
+	var offersToSubmit []OfferToSubmit
+
+	// Evaluate bid
+	bidNeedsUpdate, bidOfferID, bidReason := m.evaluateOffer(currentBid, bidPrice, OfferTypeBid)
+	if bidNeedsUpdate {
+		log.Printf("[OFFER MANAGER] BID needs update: %s", bidReason)
+		offersToSubmit = append(offersToSubmit, OfferToSubmit{
+			OfferID: bidOfferID,
+			Price:   bidPrice,
+			Type:    OfferTypeBid,
+		})
 	}
 
-	// Evaluate and execute ask side (independent of bid)
-	if err := m.evaluateAndExecute(currentAsk, askPrice, OfferTypeAsk); err != nil {
-		log.Printf("[OFFER MANAGER] Error executing ask: %v", err)
+	// Evaluate ask
+	askNeedsUpdate, askOfferID, askReason := m.evaluateOffer(currentAsk, askPrice, OfferTypeAsk)
+	if askNeedsUpdate {
+		log.Printf("[OFFER MANAGER] ASK needs update: %s", askReason)
+		offersToSubmit = append(offersToSubmit, OfferToSubmit{
+			OfferID: askOfferID,
+			Price:   askPrice,
+			Type:    OfferTypeAsk,
+		})
 	}
 
-	return nil
+	// If nothing to submit, we're done
+	if len(offersToSubmit) == 0 {
+		log.Println("[OFFER MANAGER] All offers OK - no update needed")
+		return nil
+	}
+
+	// Submit all needed offers in one transaction
+	return m.submitOffers(offersToSubmit, 0)
 }
 
-// evaluateAndExecute checks if an offer needs updating and executes if necessary
-func (m *Manager) evaluateAndExecute(currentOffer *Offer, newPrice float64, offerType OfferType) error {
+// evaluateOffer checks if an offer needs updating and returns the evaluation results
+// Returns: (needsUpdate bool, offerID int64, reason string)
+func (m *Manager) evaluateOffer(currentOffer *Offer, newPrice float64, offerType OfferType) (bool, int64, string) {
 	needsUpdate := false
 	var offerID int64 = 0 // 0 means create new offer
 	reason := ""
@@ -138,28 +176,16 @@ func (m *Manager) evaluateAndExecute(currentOffer *Offer, newPrice float64, offe
 		}
 	}
 
-	if !needsUpdate {
-		log.Printf("[OFFER MANAGER] %s offer OK - no update needed", offerType)
-		return nil
-	}
-
-	log.Printf("[OFFER MANAGER] %s offer needs update: %s", offerType, reason)
-
-	// Execute the offer
-	return m.submitOfferWithRetry(offerID, newPrice, offerType, 0)
+	return needsUpdate, offerID, reason
 }
 
-// submitOfferWithRetry submits or updates an offer on the Stellar DEX with retry logic
-func (m *Manager) submitOfferWithRetry(offerID int64, price float64, offerType OfferType, retryCount int) error {
-	// Prevent infinite recursion - allow up to 3 retries
+// submitOffers submits all offers in a SINGLE transaction
+func (m *Manager) submitOffers(offers []OfferToSubmit, retryCount int) error {
+	// Prevent infinite recursion
 	if retryCount > 3 {
-		return fmt.Errorf("max retries (3) exceeded for %s offer", offerType)
+		return fmt.Errorf("max retries (3) exceeded for offer submission")
 	}
-	return m.submitOffer(offerID, price, offerType, retryCount)
-}
 
-// submitOffer submits or updates an offer on the Stellar DEX
-func (m *Manager) submitOffer(offerID int64, price float64, offerType OfferType, retryCount int) error {
 	// Get source account
 	accountRequest := horizonclient.AccountRequest{AccountID: m.config.PublicKey}
 	sourceAccount, err := m.horizonClient.AccountDetail(accountRequest)
@@ -170,37 +196,35 @@ func (m *Manager) submitOffer(offerID int64, price float64, offerType OfferType,
 	// Build assets
 	baseAsset := m.buildAsset(m.config.BaseAsset, m.config.BaseAssetIssuer)
 	counterAsset := m.buildAsset(m.config.CounterAsset, m.config.CounterAssetIssuer)
-
-	// Build the operation based on offer type
-	var operation txnbuild.Operation
 	amount := fmt.Sprintf("%.7f", m.config.OfferManagerOptions.OfferQuantity)
-	priceStr := fmt.Sprintf("%.7f", price)
 
-	// Convert price string to xdr.Price
-	xdrPrice, err := stprice.Parse(priceStr)
-	if err != nil {
-		return fmt.Errorf("failed to parse price: %w", err)
-	}
-
-	if offerType == OfferTypeBid {
-		// Bid = Manage Buy Offer (buying base asset with counter asset)
-		operation = &txnbuild.ManageBuyOffer{
-			Selling:       counterAsset,
-			Buying:        baseAsset,
-			Amount:        amount,
-			Price:         xdrPrice,
-			OfferID:       offerID,
-			SourceAccount: m.config.PublicKey,
+	// Build operations
+	var operations []txnbuild.Operation
+	for _, offer := range offers {
+		priceStr := fmt.Sprintf("%.7f", offer.Price)
+		xdrPrice, err := stprice.Parse(priceStr)
+		if err != nil {
+			return fmt.Errorf("failed to parse price for %s: %w", offer.Type, err)
 		}
-	} else {
-		// Ask = Manage Sell Offer (selling base asset for counter asset)
-		operation = &txnbuild.ManageSellOffer{
-			Selling:       baseAsset,
-			Buying:        counterAsset,
-			Amount:        amount,
-			Price:         xdrPrice,
-			OfferID:       offerID,
-			SourceAccount: m.config.PublicKey,
+
+		if offer.Type == OfferTypeBid {
+			operations = append(operations, &txnbuild.ManageBuyOffer{
+				Selling:       counterAsset,
+				Buying:        baseAsset,
+				Amount:        amount,
+				Price:         xdrPrice,
+				OfferID:       offer.OfferID,
+				SourceAccount: m.config.PublicKey,
+			})
+		} else {
+			operations = append(operations, &txnbuild.ManageSellOffer{
+				Selling:       baseAsset,
+				Buying:        counterAsset,
+				Amount:        amount,
+				Price:         xdrPrice,
+				OfferID:       offer.OfferID,
+				SourceAccount: m.config.PublicKey,
+			})
 		}
 	}
 
@@ -209,7 +233,7 @@ func (m *Manager) submitOffer(offerID int64, price float64, offerType OfferType,
 		txnbuild.TransactionParams{
 			SourceAccount:        &sourceAccount,
 			IncrementSequenceNum: true,
-			Operations:           []txnbuild.Operation{operation},
+			Operations:           operations,
 			BaseFee:              m.config.OfferManagerOptions.FeeMaxStroops,
 			Preconditions: txnbuild.Preconditions{
 				TimeBounds: txnbuild.NewTimeout(300),
@@ -226,24 +250,38 @@ func (m *Manager) submitOffer(offerID int64, price float64, offerType OfferType,
 		return fmt.Errorf("failed to sign transaction: %w", err)
 	}
 
-	// Submit transaction
-	log.Printf("[OFFER MANAGER] Submitting %s offer: offerID=%d, price=%.6f, amount=%.4f",
-		offerType, offerID, price, m.config.OfferManagerOptions.OfferQuantity)
+	// Log submission
+	if len(offers) == 2 {
+		log.Printf("[OFFER MANAGER] Submitting BOTH offers in single transaction")
+	} else {
+		log.Printf("[OFFER MANAGER] Submitting %s offer", offers[0].Type)
+	}
 
+	// Submit transaction
 	resp, err := m.horizonClient.SubmitTransaction(tx)
 	if err != nil {
-		// Check if it's an op_offer_not_found error
+		// Check for op_offer_not_found errors and which operations failed
 		if hError, ok := err.(*horizonclient.Error); ok {
-			if m.isOfferNotFoundError(hError) {
-				log.Printf("[OFFER MANAGER] Offer not found, retrying with new offer (offerID=0)")
-				// Retry with offerID = 0 to create a new offer (increment retry counter)
-				return m.submitOffer(0, price, offerType, retryCount+1)
+			failedIndices := m.getFailedOfferIndices(hError)
+			if len(failedIndices) > 0 {
+				log.Printf("[OFFER MANAGER] Offers not found at indices %v, retrying with offerID=0", failedIndices)
+				
+				// Set failed offers to offerID=0 (create new)
+				retryOffers := make([]OfferToSubmit, len(offers))
+				copy(retryOffers, offers)
+				for _, idx := range failedIndices {
+					if idx < len(retryOffers) {
+						retryOffers[idx].OfferID = 0
+					}
+				}
+				
+				return m.submitOffers(retryOffers, retryCount+1)
 			}
 		}
 		return fmt.Errorf("failed to submit transaction: %w", err)
 	}
 
-	log.Printf("[OFFER MANAGER] ✅ %s offer submitted successfully (tx hash: %s)", offerType, resp.Hash)
+	log.Printf("[OFFER MANAGER] ✅ Offers submitted successfully (tx hash: %s)", resp.Hash)
 	return nil
 }
 
@@ -258,20 +296,23 @@ func (m *Manager) buildAsset(assetCode, assetIssuer string) txnbuild.Asset {
 	}
 }
 
-// isOfferNotFoundError checks if the error is an op_offer_not_found error
-func (m *Manager) isOfferNotFoundError(hError *horizonclient.Error) bool {
+// getFailedOfferIndices returns the indices of operations that failed with op_offer_not_found
+func (m *Manager) getFailedOfferIndices(hError *horizonclient.Error) []int {
+	var failedIndices []int
+	
 	if hError.Problem.Extras != nil {
 		if resultCodes, ok := hError.Problem.Extras["result_codes"].(map[string]interface{}); ok {
 			if operations, ok := resultCodes["operations"].([]interface{}); ok {
-				for _, op := range operations {
+				for i, op := range operations {
 					if opCode, ok := op.(string); ok && opCode == "op_offer_not_found" {
-						return true
+						failedIndices = append(failedIndices, i)
 					}
 				}
 			}
 		}
 	}
-	return false
+	
+	return failedIndices
 }
 
 // logCurrentOffers logs the current state of offers from the monitor
@@ -296,7 +337,7 @@ func (m *Manager) CancelAllOffers() error {
 
 	// Fetch all current offers from Horizon directly
 	url := fmt.Sprintf("%s/accounts/%s/offers", m.horizonClient.HorizonURL, m.config.PublicKey)
-	resp, err := m.horizonClient.HTTP.Get(url)
+	resp, err := m.httpClient.Get(url)
 	if err != nil {
 		return fmt.Errorf("failed to fetch offers: %w", err)
 	}
