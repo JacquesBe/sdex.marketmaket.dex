@@ -154,23 +154,14 @@ func (m *Monitor) reconcileOffers(horizonOffers []HorizonOffer) {
 		// Determine offer type
 		offerType := m.determineOfferType(&hOffer)
 
-		// Normalize price and quantity (bids are inverted in Horizon)
+		// Normalize price (bids have inverted price in Horizon)
 		normalizedPrice := hOffer.Price
-		normalizedQuantity := hOffer.Amount
+		normalizedQuantity := hOffer.Amount // Amount is already in base asset for both bid and ask
 		
 		if offerType == OfferTypeBid {
-			// For ManageBuyOffer:
-			// - Horizon price is EURC/XLM (selling/buying)
-			// - Horizon amount is in EURC (what you're selling)
-			// We want: price in XLM/EURC and amount in XLM
-			horizonPrice, _ := strconv.ParseFloat(hOffer.Price, 64)
-			horizonAmount, _ := strconv.ParseFloat(hOffer.Amount, 64)
-			
-			if horizonPrice > 0 {
-				// Invert price: XLM/EURC = 1 / (EURC/XLM)
+			// For ManageBuyOffer, Horizon price is EURC/XLM, we want XLM/EURC
+			if horizonPrice, err := strconv.ParseFloat(hOffer.Price, 64); err == nil && horizonPrice > 0 {
 				normalizedPrice = fmt.Sprintf("%.7f", 1.0/horizonPrice)
-				// Convert amount to XLM: XLM = EURC / (EURC/XLM)
-				normalizedQuantity = fmt.Sprintf("%.7f", horizonAmount/horizonPrice)
 			}
 		}
 
