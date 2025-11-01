@@ -272,12 +272,6 @@ func (m *Monitor) GetOffers() map[string]*Offer {
 	return offersCopy
 }
 
-// ForceRefresh fetches offers immediately (synchronously)
-func (m *Monitor) ForceRefresh() error {
-	log.Println("[OFFER MONITOR] Forcing immediate refresh...")
-	return m.fetchAndReconcileOffers()
-}
-
 // ForceRefresh immediately fetches and reconciles offers (synchronous)
 func (m *Monitor) ForceRefresh() error {
 	log.Println("[OFFER MONITOR] Forcing immediate refresh...")

@@ -93,41 +93,14 @@ func (m *Manager) ExecuteOffers(bidPrice, askPrice float64) error {
 	// Log current state
 	m.logCurrentOffers(currentOffers)
 
-	// Find current bid and ask offers, detect multiples
+	// Find current bid and ask offers
 	var currentBid, currentAsk *Offer
-	var allBids, allAsks []*Offer
 	for _, offer := range currentOffers {
 		if offer.Type == OfferTypeBid {
-			allBids = append(allBids, offer)
-			currentBid = offer // Pick last one for now
+			currentBid = offer
 		} else if offer.Type == OfferTypeAsk {
-			allAsks = append(allAsks, offer)
-			currentAsk = offer // Pick last one for now
+			currentAsk = offer
 		}
-	}
-
-	// If multiple offers per side exist, cancel extras first
-	if len(allBids) > 1 {
-		log.Printf("⚠️  [OFFER MANAGER] WARNING: Found %d BID offers (expected 1). Cancelling extras...", len(allBids))
-		if err := m.cancelExtraOffers(allBids); err != nil {
-			log.Printf("[OFFER MANAGER] Error cancelling extra bids: %v", err)
-		}
-		// Force monitor refresh after cancellation
-		if err := m.monitor.ForceRefresh(); err != nil {
-			log.Printf("[OFFER MANAGER] Error refreshing monitor: %v", err)
-		}
-		return fmt.Errorf("multiple bid offers detected, cancelled extras - retry on next tick")
-	}
-	if len(allAsks) > 1 {
-		log.Printf("⚠️  [OFFER MANAGER] WARNING: Found %d ASK offers (expected 1). Cancelling extras...", len(allAsks))
-		if err := m.cancelExtraOffers(allAsks); err != nil {
-			log.Printf("[OFFER MANAGER] Error cancelling extra asks: %v", err)
-		}
-		// Force monitor refresh after cancellation
-		if err := m.monitor.ForceRefresh(); err != nil {
-			log.Printf("[OFFER MANAGER] Error refreshing monitor: %v", err)
-		}
-		return fmt.Errorf("multiple ask offers detected, cancelled extras - retry on next tick")
 	}
 
 	// Build list of offers to submit
