@@ -252,9 +252,11 @@ func (m *Manager) submitOffers(offers []OfferToSubmit, retryCount int) error {
 
 	// Log submission
 	if len(offers) == 2 {
-		log.Printf("[OFFER MANAGER] Submitting BOTH offers in single transaction")
+		log.Printf("🚀 [OFFER MANAGER] Submitting BOTH offers in single transaction")
+	} else if offers[0].Type == OfferTypeBid {
+		log.Printf("🟢 [OFFER MANAGER] Submitting BID offer only")
 	} else {
-		log.Printf("[OFFER MANAGER] Submitting %s offer", offers[0].Type)
+		log.Printf("🔴 [OFFER MANAGER] Submitting ASK offer only")
 	}
 
 	// Submit transaction

@@ -154,23 +154,43 @@ func (m *Monitor) reconcileOffers(horizonOffers []HorizonOffer) {
 		// Determine offer type
 		offerType := m.determineOfferType(&hOffer)
 
+		// Normalize price and quantity (bids are inverted in Horizon)
+		normalizedPrice := hOffer.Price
+		normalizedQuantity := hOffer.Amount
+		
+		if offerType == OfferTypeBid {
+			// For ManageBuyOffer:
+			// - Horizon price is EURC/XLM (selling/buying)
+			// - Horizon amount is in EURC (what you're selling)
+			// We want: price in XLM/EURC and amount in XLM
+			horizonPrice, _ := strconv.ParseFloat(hOffer.Price, 64)
+			horizonAmount, _ := strconv.ParseFloat(hOffer.Amount, 64)
+			
+			if horizonPrice > 0 {
+				// Invert price: XLM/EURC = 1 / (EURC/XLM)
+				normalizedPrice = fmt.Sprintf("%.7f", 1.0/horizonPrice)
+				// Convert amount to XLM: XLM = EURC / (EURC/XLM)
+				normalizedQuantity = fmt.Sprintf("%.7f", horizonAmount/horizonPrice)
+			}
+		}
+
 		// Check if this offer already exists in our hashmap
 		if existingOffer, exists := m.offers[hOffer.ID]; exists {
 			// Offer exists - check if quantity has changed (partial fill)
-			if existingOffer.Quantity != hOffer.Amount {
+			if existingOffer.Quantity != normalizedQuantity {
 				log.Printf("[OFFER UPDATE] ID=%s Type=%s Quantity changed: %s -> %s",
-					hOffer.ID, offerType, existingOffer.Quantity, hOffer.Amount)
-				existingOffer.Quantity = hOffer.Amount
-				existingOffer.Price = hOffer.Price
+					hOffer.ID, offerType, existingOffer.Quantity, normalizedQuantity)
+				existingOffer.Quantity = normalizedQuantity
+				existingOffer.Price = normalizedPrice
 			}
 		} else {
 			// New offer not in our hashmap - add it
 			log.Printf("[OFFER NEW] ID=%s Type=%s Quantity=%s Price=%s",
-				hOffer.ID, offerType, hOffer.Amount, hOffer.Price)
+				hOffer.ID, offerType, normalizedQuantity, normalizedPrice)
 			m.offers[hOffer.ID] = &Offer{
 				OfferID:  hOffer.ID,
-				Quantity: hOffer.Amount,
-				Price:    hOffer.Price,
+				Quantity: normalizedQuantity,
+				Price:    normalizedPrice,
 				Type:     offerType,
 			}
 		}
