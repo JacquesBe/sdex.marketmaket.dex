@@ -160,15 +160,16 @@ func (m *Monitor) reconcileOffers(horizonOffers []HorizonOffer) {
 		
 		if offerType == OfferTypeBid {
 			// For ManageBuyOffer (bid):
-			// - Horizon price is EURC/XLM, we want XLM/EURC
-			// - Horizon amount is in COUNTER asset (EURC), we need BASE asset (XLM)
+			// - Horizon returns amount in COUNTER asset (EURC)
+			// - We normalize by dividing by the normalized price to get BASE asset (XLM)
 			if horizonPrice, err := strconv.ParseFloat(hOffer.Price, 64); err == nil && horizonPrice > 0 {
-				normalizedPrice = fmt.Sprintf("%.7f", 1.0/horizonPrice)
+				// Invert price first: XLM/EURC = 1 / (EURC/XLM)
+				normalizedPriceFloat := 1.0 / horizonPrice
+				normalizedPrice = fmt.Sprintf("%.7f", normalizedPriceFloat)
 				
-				// Convert counter asset amount to base asset amount
-				// amount_counter / price_counter_per_base = amount_base
-				if counterAmt, err := strconv.ParseFloat(hOffer.Amount, 64); err == nil {
-					baseAmt := counterAmt / horizonPrice
+				// Convert amount: divide Horizon amount by normalized price
+				if amt, err := strconv.ParseFloat(hOffer.Amount, 64); err == nil {
+					baseAmt := amt / normalizedPriceFloat
 					normalizedQuantity = fmt.Sprintf("%.7f", baseAmt)
 				}
 			}
@@ -177,10 +178,14 @@ func (m *Monitor) reconcileOffers(horizonOffers []HorizonOffer) {
 
 		// Check if this offer already exists in our hashmap
 		if existingOffer, exists := m.offers[hOffer.ID]; exists {
-			// Offer exists - check if quantity has changed (partial fill)
-			if existingOffer.Quantity != normalizedQuantity {
-				log.Printf("[OFFER UPDATE] ID=%s Type=%s Quantity changed: %s -> %s",
-					hOffer.ID, offerType, existingOffer.Quantity, normalizedQuantity)
+			// Offer exists - check if quantity or price changed
+			qtyChanged := existingOffer.Quantity != normalizedQuantity
+			priceChanged := existingOffer.Price != normalizedPrice
+			
+			if qtyChanged || priceChanged {
+				log.Printf("[OFFER UPDATE] ID=%s Type=%s Qty: %s->%s | Price: %s->%s",
+					hOffer.ID, offerType, existingOffer.Quantity, normalizedQuantity,
+					existingOffer.Price, normalizedPrice)
 				existingOffer.Quantity = normalizedQuantity
 				existingOffer.Price = normalizedPrice
 			}
