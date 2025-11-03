@@ -92,9 +92,15 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 		relativeInventory = (baseValue / totalValue) - 0.5
 	}
 	
+	// Calculate total wallet value in base asset terms
+	quoteInBase := qQuote / features.ExternalMidPrice
+	totalWalletBase := qBase + quoteInBase
+	
 	// Log inventory calculation details
 	log.Printf("[INVENTORY] qBase=%.4f, qQuote=%.4f, ExtMid=%.6f", qBase, qQuote, features.ExternalMidPrice)
 	log.Printf("[INVENTORY] baseValue=%.4f, totalValue=%.4f", baseValue, totalValue)
+	log.Printf("[INVENTORY] Total Wallet Value: %.4f %s (%.4f %s + %.4f %s in base terms)", 
+		totalWalletBase, s.BotConfig.BaseAsset, qBase, s.BotConfig.BaseAsset, quoteInBase, s.BotConfig.BaseAsset)
 	log.Printf("[INVENTORY] relativeInventory=%.6f (%.2f%%)", relativeInventory, relativeInventory*100)
 
 	// 3. Convert halfSpreadFloor from bps to price
@@ -102,6 +108,7 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	
 	// 4. Calculate volatility component (already in price units)
 	volComponent := volatilitySensitivity * rollingVol
+	volComponentBps := (volComponent / features.ExternalMidPrice) * 10000
 	
 	// 5. Calculate asymmetric inventory adjustment
 	// When long XLM (relativeInventory > 0): widen bid to discourage buying more
@@ -145,8 +152,8 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	
 	// Detailed breakdown of half spread components (asymmetric)
 	log.Printf("   📊 [HALF SPREAD BREAKDOWN]")
-	log.Printf("      Floor: %.6f (%.2f bps) | Vol: %.6f",
-		halfSpreadFloor, halfSpreadFloorBps, volComponent)
+	log.Printf("      Floor: %.6f (%.2f bps) | Vol: %.6f (%.2f bps)",
+		halfSpreadFloor, halfSpreadFloorBps, volComponent, volComponentBps)
 	log.Printf("      BID HalfSpread: %.6f (%.2f bps) | ASK HalfSpread: %.6f (%.2f bps)",
 		halfSpreadBid, halfSpreadBidBps, halfSpreadAsk, halfSpreadAskBps)
 	
