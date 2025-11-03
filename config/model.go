@@ -25,7 +25,8 @@ type PriceFeedOptions struct {
 	Inverse            bool    `bson:"inverse"`
 	PriceFeedMultiple  float64 `bson:"priceFeedMultiple"`
 	BufferLength       int     `bson:"bufferLength"`
-	BookDepth          int     `bson:"bookDepth"` // Order book depth level (5, 10, or 20)
+	BookDepth          int     `bson:"bookDepth"`         // Order book depth level (5, 10, or 20)
+	SSETimeoutSeconds  int     `bson:"sseTimeoutSeconds"` // SSE read timeout in seconds (Horizon only)
 }
 
 // GetTradingSymbol returns the Binance trading symbol format (e.g., "XLMEUR")

@@ -3,6 +3,7 @@ package strategy
 import (
 	"fmt"
 	"log"
+	"sync"
 
 	"github.com/jacquesbecker/sdex-marketmaker/balance"
 	"github.com/jacquesbecker/sdex-marketmaker/config"
@@ -11,12 +12,16 @@ import (
 
 // StrategyEngine manages the market making strategy
 type StrategyEngine struct {
-	Feed      *pricefeed.BinanceFeed
-	BotConfig *config.BotConfig
+	Feed           pricefeed.PriceFeed
+	BotConfig      *config.BotConfig
+	mu             sync.RWMutex
+	latestBid      float64
+	latestAsk      float64
+	hasPrices      bool
 }
 
 // NewStrategyEngine creates a new strategy engine with given feed and config
-func NewStrategyEngine(feed *pricefeed.BinanceFeed, botConfig *config.BotConfig) *StrategyEngine {
+func NewStrategyEngine(feed pricefeed.PriceFeed, botConfig *config.BotConfig) *StrategyEngine {
 	return &StrategyEngine{
 		Feed:      feed,
 		BotConfig: botConfig,
@@ -50,14 +55,19 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	var qBase, qQuote float64
 	if monitor != nil {
 		baseBalance, counterBalance, err := monitor.GetLatestBalances()
-		if err == nil {
-			if _, err := fmt.Sscanf(baseBalance.Balance, "%f", &qBase); err != nil {
-				qBase = 0
-			}
-			if _, err := fmt.Sscanf(counterBalance.Balance, "%f", &qQuote); err != nil {
-				qQuote = 0
-			}
+		if err != nil {
+			log.Printf("[STRATEGY] No balances available yet, skipping quote computation")
+			return 0, 0, false
 		}
+		if _, err := fmt.Sscanf(baseBalance.Balance, "%f", &qBase); err != nil {
+			qBase = 0
+		}
+		if _, err := fmt.Sscanf(counterBalance.Balance, "%f", &qQuote); err != nil {
+			qQuote = 0
+		}
+	} else {
+		log.Printf("[STRATEGY] Balance monitor not initialized, skipping quote computation")
+		return 0, 0, false
 	}
 
 	// Get strategy parameters from bot config
@@ -156,6 +166,31 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 		return 0, 0, false
 	}
 
+	// Store latest prices
+	s.mu.Lock()
+	s.latestBid = pBid
+	s.latestAsk = pAsk
+	s.hasPrices = true
+	s.mu.Unlock()
+
 	return pBid, pAsk, true
+}
+
+// GetLatestPrices returns the most recently computed bid/ask prices
+// Returns (bid, ask, ok) where ok indicates if prices are available
+func (s *StrategyEngine) GetLatestPrices() (float64, float64, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.latestBid, s.latestAsk, s.hasPrices
+}
+
+// ClearPrices invalidates stored prices (called when price feed dies)
+func (s *StrategyEngine) ClearPrices() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hasPrices = false
+	s.latestBid = 0
+	s.latestAsk = 0
+	log.Println("[STRATEGY] Prices cleared due to price feed reconnection")
 }
 

@@ -32,6 +32,11 @@ type Offer struct {
 	Type     OfferType // bid or ask
 }
 
+// StrategyPriceProvider is an interface for getting latest prices from strategy
+type StrategyPriceProvider interface {
+	GetLatestPrices() (bid float64, ask float64, ok bool)
+}
+
 // Manager handles offer execution on the Stellar DEX
 type Manager struct {
 	config         *config.BotConfig
@@ -40,10 +45,11 @@ type Manager struct {
 	sourcekeypair  *keypair.Full
 	networkPass    string
 	monitor        *Monitor
+	strategy       StrategyPriceProvider
 }
 
 // NewManager creates a new offer manager
-func NewManager(botConfig *config.BotConfig, horizonBaseURI string, networkPassphrase string, monitor *Monitor) (*Manager, error) {
+func NewManager(botConfig *config.BotConfig, horizonBaseURI string, networkPassphrase string, monitor *Monitor, strategy StrategyPriceProvider) (*Manager, error) {
 	// Parse the secret key
 	kp, err := keypair.ParseFull(botConfig.SecretKey)
 	if err != nil {
@@ -67,6 +73,7 @@ func NewManager(botConfig *config.BotConfig, horizonBaseURI string, networkPassp
 		sourcekeypair:  kp,
 		networkPass:    networkPassphrase,
 		monitor:        monitor,
+		strategy:       strategy,
 	}, nil
 }
 
@@ -78,7 +85,14 @@ type OfferToSubmit struct {
 }
 
 // ExecuteOffers evaluates current offers and submits/updates as needed
-func (m *Manager) ExecuteOffers(bidPrice, askPrice float64) error {
+// Now gets prices from Strategy instead of parameters
+func (m *Manager) ExecuteOffers() error {
+	// Get latest prices from strategy
+	bidPrice, askPrice, ok := m.strategy.GetLatestPrices()
+	if !ok {
+		log.Printf("[OFFER MANAGER] No prices available from strategy yet, skipping")
+		return nil
+	}
 	// Sanity check prices
 	if bidPrice <= 0 || askPrice <= 0 {
 		return fmt.Errorf("invalid prices: bid=%.6f, ask=%.6f (must be positive)", bidPrice, askPrice)
@@ -156,11 +170,11 @@ func (m *Manager) evaluateOffer(currentOffer *Offer, newPrice float64, offerType
 		// Check price grace
 		currentPrice, _ := strconv.ParseFloat(currentOffer.Price, 64)
 		priceDiff := math.Abs(currentPrice - newPrice)
-		priceDiffBps := (priceDiff / currentPrice) * 10000
+		priceDiffBps := math.Floor((priceDiff / currentPrice) * 10000)
 
 		if priceDiffBps > m.config.OfferManagerOptions.PriceGraceBasisPoints {
 			needsUpdate = true
-			reason = fmt.Sprintf("price diff %.2f bps > grace %.2f bps", priceDiffBps, m.config.OfferManagerOptions.PriceGraceBasisPoints)
+			reason = fmt.Sprintf("price diff %.0f bps > grace %.2f bps", priceDiffBps, m.config.OfferManagerOptions.PriceGraceBasisPoints)
 		}
 
 		// Check quantity grace

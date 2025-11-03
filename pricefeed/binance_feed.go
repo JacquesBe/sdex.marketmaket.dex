@@ -332,6 +332,7 @@ type BinanceFeed struct {
 	FeatureBuilder      FeatureBuilder
 	LastMessageAt       int64 // unix ms of last WS message read
 	obLogCounter        int
+	onFeatureUpdate     FeatureUpdateCallback
 }
 
 // NewBinanceFeed creates a new Binance price feed
@@ -511,6 +512,11 @@ depthBidSum, depthAskSum := utils.ComputeDepth(bids, asks, b.config.PriceFeedOpt
 	// Append feature on every orderbook update (no throttling)
 	b.Features.Append(featureRow)
 	
+	// Invoke callback if set
+	if b.onFeatureUpdate != nil {
+		b.onFeatureUpdate()
+	}
+	
 	// Debug: log feature buffer status
 	b.Features.mu.RLock()
 	count := b.Features.count
@@ -557,6 +563,16 @@ func (b *BinanceFeed) GetLatestFeatures() (FeaturesRow, bool) {
 // GetLastMessageAt returns the last time a WS message was received (unix ms)
 func (b *BinanceFeed) GetLastMessageAt() int64 {
 	return b.LastMessageAt
+}
+
+// SetFeatureUpdateCallback sets the callback to invoke when features are updated
+func (b *BinanceFeed) SetFeatureUpdateCallback(callback FeatureUpdateCallback) {
+	b.onFeatureUpdate = callback
+}
+
+// SetDisconnectCallback sets the callback to invoke when feed disconnects (no-op for Binance)
+func (b *BinanceFeed) SetDisconnectCallback(callback DisconnectCallback) {
+	// Binance feed doesn't support disconnect callback
 }
 
 // Stop gracefully stops the price feed

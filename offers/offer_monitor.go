@@ -45,6 +45,9 @@ type HorizonOffersResponse struct {
 	} `json:"_embedded"`
 }
 
+// OfferUpdateCallback is called when offers are reconciled
+type OfferUpdateCallback func()
+
 // Monitor monitors offers on the Stellar DEX
 type Monitor struct {
 	config         *config.BotConfig
@@ -53,6 +56,7 @@ type Monitor struct {
 	stopChan       chan bool
 	mu             sync.RWMutex
 	offers         map[string]*Offer // offerID -> Offer
+	onUpdate       OfferUpdateCallback
 }
 
 var (
@@ -92,19 +96,26 @@ func (m *Monitor) Start() error {
 	defer ticker.Stop()
 
 	// Fetch offers immediately on start (do not exit on error)
+	log.Printf("[OFFER MONITOR] Fetching initial offers...")
 	if err := m.fetchAndReconcileOffers(); err != nil {
-		log.Printf("Initial offer fetch error: %v", err)
+		log.Printf("[OFFER MONITOR] Initial offer fetch error: %v", err)
+	} else {
+		log.Printf("[OFFER MONITOR] Initial offers fetched successfully")
 	}
 
+	log.Printf("[OFFER MONITOR] Entering main poll loop")
 	for {
 		select {
 		case t := <-ticker.C:
 			log.Printf("[OFFER TICK] %s", t.Format(time.RFC3339))
+			log.Printf("[OFFER MONITOR] Fetching offers from Horizon...")
 			if err := m.fetchAndReconcileOffers(); err != nil {
-				log.Printf("Offer fetch error: %v", err)
+				log.Printf("[OFFER MONITOR] Fetch error: %v", err)
+			} else {
+				log.Printf("[OFFER MONITOR] Fetch completed successfully")
 			}
 		case <-m.stopChan:
-			log.Println("Offer monitor stopped")
+			log.Println("[OFFER MONITOR] Stopped")
 			return nil
 		}
 	}
@@ -138,9 +149,11 @@ func (m *Monitor) fetchAndReconcileOffers() error {
 
 // reconcileOffers updates the local hashmap based on current market state
 func (m *Monitor) reconcileOffers(horizonOffers []HorizonOffer) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	log.Printf("[OFFER MONITOR] Reconciling %d offers from Horizon", len(horizonOffers))
 
+	// Lock for hashmap modifications
+	m.mu.Lock()
+	
 	// Build a set of current offer IDs from Horizon
 	currentOfferIDs := make(map[string]bool)
 	for _, hOffer := range horizonOffers {
@@ -214,6 +227,29 @@ func (m *Monitor) reconcileOffers(horizonOffers []HorizonOffer) {
 	if len(m.offers) > 0 {
 		m.logOfferState()
 	}
+	
+	// Release lock before invoking callback
+	m.mu.Unlock()
+	
+	// Trigger callback AFTER releasing the lock (with panic recovery)
+	if m.onUpdate != nil {
+		log.Printf("[OFFER MONITOR] Invoking offer manager callback")
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[OFFER MONITOR] PANIC in callback: %v", r)
+				}
+			}()
+			m.onUpdate()
+		}()
+	} else {
+			log.Printf("[OFFER MONITOR] WARNING: No callback set!")
+	}
+}
+
+// SetOfferUpdateCallback sets the callback to invoke when offers are reconciled
+func (m *Monitor) SetOfferUpdateCallback(callback OfferUpdateCallback) {
+	m.onUpdate = callback
 }
 
 // isRelevantOffer checks if the offer is for our configured trading pair

@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -68,23 +71,44 @@ func main() {
 	// WaitGroup to track running services
 	var wg sync.WaitGroup
 
-	// Initialize Binance price feed
-	feed := pricefeed.NewBinanceFeed(botConfig)
+	// Prompt user to select price feed source
+	priceFeedSource := promptPriceFeedSource()
+	log.Printf("Selected price feed source: %s", priceFeedSource)
+
+	// Initialize offer monitor (needed before Horizon feed)
+	offerMonitor := offers.NewMonitor(botConfig, horizonBaseURI)
+
+	// Initialize the selected price feed
+	var feed pricefeed.PriceFeed
+	if priceFeedSource == "stellar" {
+		feed = pricefeed.NewHorizonFeed(botConfig, horizonBaseURI, offerMonitor)
+		log.Println("Using Stellar/Horizon price feed")
+	} else {
+		feed = pricefeed.NewBinanceFeed(botConfig)
+		log.Println("Using Binance price feed")
+	}
 
 	// Run price feed in a goroutine (background service)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		if err := feed.Start(); err != nil {
-			log.Printf("Price feed error: %v", err)
+			log.Printf("❌ [PRICE FEED] FATAL ERROR: %v", err)
+			log.Println("[SHUTDOWN] Price feed encountered fatal error, shutting down bot...")
+			// Send shutdown signal
+			syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
 		}
 	}()
 
-	// Initialize offer monitor
-	offerMonitor := offers.NewMonitor(botConfig, horizonBaseURI)
+	// Initialize strategy engine
+	engine := strategy.NewStrategyEngine(feed, botConfig)
+	log.Printf("Strategy engine initialized (volWindow=%dms, blendWeight=%.2f, riskAversion=%.3f)",
+		botConfig.StrategyOptions.VolWindowMs,
+		botConfig.StrategyOptions.BlendWeight,
+		botConfig.StrategyOptions.RiskAversion)
 
-	// Initialize offer manager
-	offerManager, err := offers.NewManager(botConfig, horizonBaseURI, networkPassphrase, offerMonitor)
+	// Initialize offer manager (use existing offerMonitor from above)
+	offerManager, err := offers.NewManager(botConfig, horizonBaseURI, networkPassphrase, offerMonitor, engine)
 	if err != nil {
 		log.Fatalf("Failed to initialize offer manager: %v", err)
 	}
@@ -95,40 +119,48 @@ func main() {
 		log.Printf("[STARTUP] Warning: Failed to cancel offers: %v", err)
 	}
 
-	// Initialize strategy engine
-	engine := strategy.NewStrategyEngine(feed, botConfig)
-	log.Printf("Strategy engine initialized (volWindow=%dms, blendWeight=%.2f, riskAversion=%.3f)",
-		botConfig.StrategyOptions.VolWindowMs,
-		botConfig.StrategyOptions.BlendWeight,
-		botConfig.StrategyOptions.RiskAversion)
-
 	// Initialize and start the Balance Monitor
 	balanceMonitor := balance.NewMonitor(botConfig, horizonBaseURI)
 	
 	// Track startup time for 30-second warmup
 	startupTime := time.Now()
 	
-	// Set callback to invoke strategy when balances are updated
-balanceMonitor.SetBalanceUpdateCallback(func() {
-		log.Printf("[STRATEGY] Invoking ComputeQuotes...")
+	// Set callback: Pricefeed invokes Strategy
+	feed.SetFeatureUpdateCallback(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[PANIC] Strategy callback panicked: %v", r)
+			}
+		}()
 		pBid, pAsk, ok := engine.ComputeQuotes()
-		log.Printf("[STRATEGY] ComputeQuotes ok=%v", ok)
 		if ok {
-			log.Printf("\n💰 [QUOTES] BID: %.6f | ASK: %.6f | Spread: %.6f (%.1fbps)\n",
+			log.Printf("💰 [QUOTES] BID: %.6f | ASK: %.6f | Spread: %.6f (%.1fbps)",
 				pBid, pAsk, pAsk-pBid, ((pAsk-pBid)/((pBid+pAsk)/2))*10000)
-			
-			// Check if warmup period has passed (30 seconds)
-			elapsed := time.Since(startupTime).Seconds()
-			if elapsed < 30 {
-				log.Printf("[STRATEGY] Warmup period: %.0fs elapsed, waiting for 30s before executing offers...", elapsed)
-				return
+		}
+	})
+	
+	// Set disconnect callback: Clear strategy prices when feed dies
+	feed.SetDisconnectCallback(func() {
+		engine.ClearPrices()
+	})
+	
+	// Set callback: OfferMonitor invokes OfferManager
+	offerMonitor.SetOfferUpdateCallback(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[PANIC] OfferManager callback panicked: %v", r)
 			}
-			
-			// Execute offers
-			log.Printf("[STRATEGY] Executing offers...")
-			if err := offerManager.ExecuteOffers(pBid, pAsk); err != nil {
-				log.Printf("[STRATEGY] Error executing offers: %v", err)
-			}
+		}()
+		// Check if warmup period has passed (30 seconds)
+		elapsed := time.Since(startupTime).Seconds()
+		if elapsed < 30 {
+			log.Printf("[OFFER MANAGER] Warmup period: %.0fs elapsed, waiting for 30s before executing offers...", elapsed)
+			return
+		}
+		
+		// Execute offers (reads prices from strategy internally)
+		if err := offerManager.ExecuteOffers(); err != nil {
+			log.Printf("[OFFER MANAGER] Error executing offers: %v", err)
 		}
 	})
 	
@@ -150,32 +182,36 @@ balanceMonitor.SetBalanceUpdateCallback(func() {
 		}
 	}()
 
-	// Price feed watchdog - shuts down bot if feed dies
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		log.Println("[WATCHDOG] Price feed watchdog started (30s timeout)")
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
+	// Price feed watchdog - only for Binance (Horizon can have long quiet periods)
+	if priceFeedSource == "binance" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			log.Println("[WATCHDOG] Price feed watchdog started (60s timeout) - Binance only")
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
 
-		for {
-			select {
-			case <-ticker.C:
-				lastMsg := feed.GetLastMessageAt()
-				if lastMsg == 0 {
-					// Still initializing
-					continue
-				}
-				elapsed := time.Now().UnixMilli() - lastMsg
-				if elapsed > 30000 { // 30 seconds
-					log.Printf("\n\u274c [WATCHDOG] CRITICAL: Price feed died! Last message %dms ago. Shutting down...", elapsed)
-					// Send shutdown signal
-					syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
-					return
+			for {
+				select {
+				case <-ticker.C:
+					lastMsg := feed.GetLastMessageAt()
+					if lastMsg == 0 {
+						// Still initializing
+						continue
+					}
+					elapsed := time.Now().UnixMilli() - lastMsg
+					if elapsed > 60000 { // 60 seconds
+						log.Printf("\n\u274c [WATCHDOG] CRITICAL: Price feed died! Last message %dms ago. Shutting down...", elapsed)
+						// Send shutdown signal
+						syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
+						return
+					}
 				}
 			}
-		}
-	}()
+		}()
+	} else {
+		log.Println("[WATCHDOG] Watchdog disabled for Horizon feed (quiet markets are normal)")
+	}
 
 	// Wait for interrupt signal to gracefully shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -230,4 +266,34 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// promptPriceFeedSource prompts the user to select a price feed source
+func promptPriceFeedSource() string {
+	reader := bufio.NewReader(os.Stdin)
+	
+	for {
+		fmt.Println("\n=== Price Feed Selection ===")
+		fmt.Println("Which price feed source would you like to use?")
+		fmt.Println("  1. stellar  - Use Stellar/Horizon order book (native DEX prices)")
+		fmt.Println("  2. binance  - Use Binance CEX order book (external prices)")
+		fmt.Print("\nEnter your choice (stellar/binance): ")
+		
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			log.Printf("Error reading input: %v", err)
+			continue
+		}
+		
+		// Trim whitespace and convert to lowercase
+		choice := strings.TrimSpace(strings.ToLower(input))
+		
+		if choice == "stellar" || choice == "1" {
+			return "stellar"
+		} else if choice == "binance" || choice == "2" {
+			return "binance"
+		} else {
+			fmt.Printf("Invalid choice '%s'. Please enter 'stellar' or 'binance'.\n", choice)
+		}
+	}
 }

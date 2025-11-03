@@ -39,9 +39,6 @@ type AssetBalance struct {
 	Limit              string
 }
 
-// BalanceUpdateCallback is a function type that gets called when balances are updated
-type BalanceUpdateCallback func()
-
 // Monitor manages the balance monitoring service
 type Monitor struct {
 	config         *config.BotConfig
@@ -51,7 +48,6 @@ type Monitor struct {
 	mu             sync.RWMutex
 	baseBalance    *AssetBalance
 	counterBalance *AssetBalance
-	onUpdate       BalanceUpdateCallback
 	lastUpdateAt   int64 // unix ms of last successful balance fetch
 	logCounter     int
 }
@@ -142,11 +138,6 @@ func (m *Monitor) fetchBalances() error {
 	return nil
 }
 
-// SetBalanceUpdateCallback sets the callback function to be called when balances are updated
-func (m *Monitor) SetBalanceUpdateCallback(callback BalanceUpdateCallback) {
-	m.onUpdate = callback
-}
-
 // updateBalances updates the cached balances for base and counter assets
 func (m *Monitor) updateBalances(account *HorizonAccountResponse) {
 	m.mu.Lock()
@@ -172,12 +163,6 @@ func (m *Monitor) updateBalances(account *HorizonAccountResponse) {
 		}
 	}
 	m.mu.Unlock()
-	
-	// Trigger callback AFTER releasing the lock to avoid deadlock
-	if m.onUpdate != nil {
-		log.Printf("[BALANCE CALLBACK] invoking strategy update")
-		m.onUpdate()
-	}
 }
 
 // isBaseAsset checks if a balance matches the configured base asset
