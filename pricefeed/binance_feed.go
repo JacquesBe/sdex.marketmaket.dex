@@ -147,15 +147,21 @@ func (OrderbookUtils) ComputeBest(bids, asks []OrderBookLevel) (bestBid, bestAsk
 }
 
 // ComputeDepth sums quantities across specified depth levels
+// Converts bid quantities from counter asset to base asset
 func (OrderbookUtils) ComputeDepth(bids, asks []OrderBookLevel, depth int) (bidSum, askSum float64) {
 	for i := 0; i < depth && i < len(bids); i++ {
-		var qty float64
+		var qty, price float64
 		fmt.Sscanf(bids[i].Quantity, "%f", &qty)
-		bidSum += qty
+		fmt.Sscanf(bids[i].Price, "%f", &price)
+		// Bid qty is in counter asset (SHX), convert to base (XLM): qty / price
+		if price > 0 {
+			bidSum += qty / price
+		}
 	}
 	for i := 0; i < depth && i < len(asks); i++ {
 		var qty float64
 		fmt.Sscanf(asks[i].Quantity, "%f", &qty)
+		// Ask qty is already in base asset (XLM)
 		askSum += qty
 	}
 	return
@@ -202,14 +208,17 @@ func (fb FeatureBuilder) Build(ob *OrderbookState, featuresBuffer *FeaturesBuffe
 	}
 	
 	// Calculate TOB: (size at best bid - size at best ask) / (size at best bid + size at best ask)
-	var tob float64
-	if denomL1 > 0 {
-		tob = (ob.BestBidQty - ob.BestAskQty) / denomL1
+	
+	// Calculate depth-based imbalance using full depth instead of L1 only
+	var depthImbalance float64
+	denomDepth := ob.DepthBidSum + ob.DepthAskSum
+	if denomDepth > 0 {
+		depthImbalance = (ob.DepthBidSum - ob.DepthAskSum) / denomDepth
 	}
 	
-	// Calculate penalties
-	bidPenalty := max(0, -tob)  // max(0, -TOB)
-	askPenalty := max(0, tob)   // max(0, +TOB)
+	// Calculate penalties based on DEPTH (more robust than L1)
+	bidPenalty := max(0, -depthImbalance)  // max(0, -DepthImbalance) = ask side heavier
+	askPenalty := max(0, depthImbalance)   // max(0, +DepthImbalance) = bid side heavier
 	
 	// Calculate rolling volatility (absolute) - standard deviation of external mid price
 	var rollingVolatility *float64

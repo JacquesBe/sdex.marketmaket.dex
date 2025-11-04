@@ -116,9 +116,12 @@ func (h *HorizonFeed) Start() error {
 	}
 	
 	// Start polling loop
-	for {
+	for h.reconnect {
 		select {
 		case <-ticker.C:
+			if !h.reconnect {
+				return nil
+			}
 			if err := h.fetchOrderBook(); err != nil {
 				log.Printf("[HORIZON POLL] Fetch error: %v", err)
 				// Invoke disconnect callback to clear strategy prices
@@ -128,6 +131,7 @@ func (h *HorizonFeed) Start() error {
 			}
 		}
 	}
+	return nil
 }
 
 // fetchOrderBook fetches the order book via REST API
@@ -221,9 +225,16 @@ func (h *HorizonFeed) processOrderBookData(orderBook *HorizonOrderBookResponse) 
 	// Get current offers from offer monitor to filter them out
 	currentOffers := h.offerMonitor.GetOffers()
 	
+	// DEBUG: Log raw orderbook sizes BEFORE filtering
+	log.Printf("[DEBUG OB] RAW from Horizon: %d bids, %d asks", len(orderBook.Bids), len(orderBook.Asks))
+	
 	// Convert to OrderBookLevels and filter out our own offers
+	// Horizon's convention matches ours: bids=buying XLM, asks=selling XLM
 	bids := h.filterAndConvertLevels(orderBook.Bids, currentOffers, offers.OfferTypeBid)
 	asks := h.filterAndConvertLevels(orderBook.Asks, currentOffers, offers.OfferTypeAsk)
+	
+	// DEBUG: Log after filtering
+	log.Printf("[DEBUG OB] AFTER filtering: %d bids, %d asks", len(bids), len(asks))
 
 	// Validate we have data
 	if len(bids) == 0 || len(asks) == 0 {
@@ -235,6 +246,10 @@ func (h *HorizonFeed) processOrderBookData(orderBook *HorizonOrderBookResponse) 
 	utils := OrderbookUtils{}
 	bestBid, bestAsk, bestBidQty, bestAskQty := utils.ComputeBest(bids, asks)
 	depthBidSum, depthAskSum := utils.ComputeDepth(bids, asks, h.config.PriceFeedOptions.BookDepth)
+	
+	// DEBUG: Log computed depth values
+	log.Printf("[DEBUG DEPTH] depthBidSum=%.2f, depthAskSum=%.2f (from %d levels)", 
+		depthBidSum, depthAskSum, h.config.PriceFeedOptions.BookDepth)
 
 	timestamp := time.Now().UnixMilli()
 	obState := &OrderbookState{

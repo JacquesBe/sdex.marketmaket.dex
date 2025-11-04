@@ -75,6 +75,7 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	halfSpreadFloorBps := s.BotConfig.StrategyOptions.HalfSpreadFloor // in basis points
 	volatilitySensitivity := s.BotConfig.StrategyOptions.VolatilitySensitivity
 	inventoryBias := s.BotConfig.StrategyOptions.InventoryBias
+	orderBookBias := s.BotConfig.StrategyOptions.OBImbalanceSensitivity
 
 	// 1. Calculate fair price: (1 - blendWeight) * externalMidPrice + blendWeight * microprice
 	fairPrice := (1-blendWeight)*features.ExternalMidPrice + blendWeight*features.MicroPrice
@@ -82,6 +83,12 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 		log.Printf("[STRATEGY] Invalid fair price: %.6f", fairPrice)
 		return 0, 0, false
 	}
+	
+	// Calculate total wallet value in base asset terms using fair price
+	quoteInBase := qQuote / fairPrice
+	totalWalletBase := qBase + quoteInBase
+	log.Printf("[INVENTORY] Total Wallet Value: %.4f %s (%.4f %s + %.4f %s in base terms at fair price)", 
+		totalWalletBase, s.BotConfig.BaseAsset, qBase, s.BotConfig.BaseAsset, quoteInBase, s.BotConfig.BaseAsset)
 
 	// 2. Calculate relative inventory: (qBase * ExtMid) / ((qBase * ExtMid) + qQuote) - 0.5
 	// Range: [-0.5, 0.5] where 0 = balanced
@@ -92,15 +99,9 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 		relativeInventory = (baseValue / totalValue) - 0.5
 	}
 	
-	// Calculate total wallet value in base asset terms
-	quoteInBase := qQuote / features.ExternalMidPrice
-	totalWalletBase := qBase + quoteInBase
-	
 	// Log inventory calculation details
 	log.Printf("[INVENTORY] qBase=%.4f, qQuote=%.4f, ExtMid=%.6f", qBase, qQuote, features.ExternalMidPrice)
 	log.Printf("[INVENTORY] baseValue=%.4f, totalValue=%.4f", baseValue, totalValue)
-	log.Printf("[INVENTORY] Total Wallet Value: %.4f %s (%.4f %s + %.4f %s in base terms)", 
-		totalWalletBase, s.BotConfig.BaseAsset, qBase, s.BotConfig.BaseAsset, quoteInBase, s.BotConfig.BaseAsset)
 	log.Printf("[INVENTORY] relativeInventory=%.6f (%.2f%%)", relativeInventory, relativeInventory*100)
 
 	// 3. Convert halfSpreadFloor from bps to price
@@ -113,19 +114,33 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	// 5. Calculate asymmetric inventory adjustment
 	// When long XLM (relativeInventory > 0): widen bid to discourage buying more
 	// When short XLM (relativeInventory < 0): widen ask to discourage selling more
-	invComponentBid := inventoryBias * max(0, relativeInventory) * features.ExternalMidPrice
-	invComponentAsk := inventoryBias * max(0, -relativeInventory) * features.ExternalMidPrice
+	invComponentBid := inventoryBias * max(0, relativeInventory) * fairPrice
+	invComponentAsk := inventoryBias * max(0, -relativeInventory) * fairPrice
 	
 	// Log inventory adjustment calculation
 	log.Printf("[INVENTORY ADJ] relativeInventory=%.6f | inventoryBias=%.6f", 
 		relativeInventory, inventoryBias)
 	log.Printf("[INVENTORY ADJ] invComponentBid=%.8f | invComponentAsk=%.8f", invComponentBid, invComponentAsk)
 	
-	// 6. Calculate half spreads asymmetrically
-	halfSpreadBid := halfSpreadFloor + volComponent + invComponentBid
-	halfSpreadAsk := halfSpreadFloor + volComponent + invComponentAsk
+	// 6. Calculate orderbook imbalance penalties
+	// BidPenalty high = orderbook ask side heavy (sellers) -> widen YOUR bid (you compete with sellers)
+	// AskPenalty high = orderbook bid side heavy (buyers) -> widen YOUR ask (you compete with buyers)
+	obPenaltyBid := orderBookBias * features.BidPenalty * fairPrice
+	obPenaltyAsk := orderBookBias * features.AskPenalty * fairPrice
+	
+	log.Printf("[OB IMBALANCE] BidPenalty=%.6f | AskPenalty=%.6f | orderBookBias=%.6f", 
+		features.BidPenalty, features.AskPenalty, orderBookBias)
+	log.Printf("[OB IMBALANCE] obPenaltyBid=%.8f | obPenaltyAsk=%.8f", obPenaltyBid, obPenaltyAsk)
+	
+	// 7. Calculate half spreads asymmetrically
+	halfSpreadBid := halfSpreadFloor + volComponent + invComponentBid + obPenaltyBid
+	halfSpreadAsk := halfSpreadFloor + volComponent + invComponentAsk + obPenaltyAsk
+	
+	// 7b. Enforce floor - ensure half spreads NEVER go below minimum
+	halfSpreadBid = max(halfSpreadBid, halfSpreadFloor)
+	halfSpreadAsk = max(halfSpreadAsk, halfSpreadFloor)
 
-	// 7. Calculate final bid and ask prices
+	// 8. Calculate final bid and ask prices
 	pBid = fairPrice - halfSpreadBid
 	pAsk = fairPrice + halfSpreadAsk
 
@@ -135,11 +150,11 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	halfSpreadBidBps := (halfSpreadBid / fairPrice) * 10000
 	halfSpreadAskBps := (halfSpreadAsk / fairPrice) * 10000
 	
-	// Calculate bid and ask spread from external mid price in basis points
-	bidSpreadFromExtMid := features.ExternalMidPrice - pBid
-	bidSpreadFromExtMidBps := (bidSpreadFromExtMid / features.ExternalMidPrice) * 10000
-	askSpreadFromExtMid := pAsk - features.ExternalMidPrice
-	askSpreadFromExtMidBps := (askSpreadFromExtMid / features.ExternalMidPrice) * 10000
+	// Calculate bid and ask spread from fair price in basis points
+	bidSpreadFromFair := fairPrice - pBid
+	bidSpreadFromFairBps := (bidSpreadFromFair / fairPrice) * 10000
+	askSpreadFromFair := pAsk - fairPrice
+	askSpreadFromFairBps := (askSpreadFromFair / fairPrice) * 10000
 
 	// Row 1: Input metrics
 	log.Printf("\n💰 [STRATEGY INVOCATION]")
@@ -157,9 +172,9 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	log.Printf("      BID HalfSpread: %.6f (%.2f bps) | ASK HalfSpread: %.6f (%.2f bps)",
 		halfSpreadBid, halfSpreadBidBps, halfSpreadAsk, halfSpreadAskBps)
 	
-	// Row 3: Final quotes with spreads from external mid
-	log.Printf("   🟢 BID: %.6f (%.2f bps from extMid) | 🔴 ASK: %.6f (%.2f bps from extMid)", 
-		pBid, bidSpreadFromExtMidBps, pAsk, askSpreadFromExtMidBps)
+	// Row 3: Final quotes with spreads from fair price
+	log.Printf("   🟢 BID: %.6f (%.2f bps from fair) | 🔴 ASK: %.6f (%.2f bps from fair)", 
+		pBid, bidSpreadFromFairBps, pAsk, askSpreadFromFairBps)
 	log.Printf("   Total Spread: %.6f (%.2f bps)\n", spread, spreadBps)
 
 	// Sanity checks
