@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/jacquesbecker/sdex-marketmaker/config"
@@ -46,6 +47,7 @@ type Manager struct {
 	networkPass    string
 	monitor        *Monitor
 	strategy       StrategyPriceProvider
+	submitMutex    sync.Mutex // Prevents concurrent transaction submissions
 }
 
 // NewManager creates a new offer manager
@@ -87,6 +89,13 @@ type OfferToSubmit struct {
 // ExecuteOffers evaluates current offers and submits/updates as needed
 // Now gets prices from Strategy instead of parameters
 func (m *Manager) ExecuteOffers() error {
+	// Check if already submitting - non-blocking check
+	if !m.submitMutex.TryLock() {
+		log.Printf("[OFFER MANAGER] Submission already in progress, skipping this tick")
+		return nil
+	}
+	defer m.submitMutex.Unlock()
+
 	// Get latest prices from strategy
 	bidPrice, askPrice, ok := m.strategy.GetLatestPrices()
 	if !ok {
