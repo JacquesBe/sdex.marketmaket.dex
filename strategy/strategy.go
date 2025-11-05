@@ -155,10 +155,6 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	halfSpreadAskBps := (halfSpreadAsk / fairPrice) * 10000
 	volComponentBps := (volComponent / fairPrice) * 10000
 	
-	// Calculate half spreads in base asset terms
-	halfSpreadBidBaseAsset := halfSpreadBid / fairPrice * totalWalletBase
-	halfSpreadAskBaseAsset := halfSpreadAsk / fairPrice * totalWalletBase
-	
 	log.Printf("\n" +
 		"╔════════════════════════════════════════════════════════════════════════════════╗\n" +
 		"║ 💰 MARKET MAKING STRATEGY                                                     ║\n" +
@@ -168,17 +164,17 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 		"║ Portfolio│ Inventory: %6.1f%% │ Total Value: %8.2f %-4s                   ║\n" +
 		"║ Volatility│ Rolling: %8.6f │ Impact: %6.1f bps each side             ║\n" +
 		"╠════════════════════════════════════════════════════════════════════════════════╣\n" +
-		"║          │    PRICE    │  HALF SPREAD  │  FROM FAIR  │  IN BASE ASSET         ║\n" +
-		"║ 🟢 BID   │  %9.6f │   %6.1f bps   │  %6.1f bps  │  %8.2f %-4s      ║\n" +
-		"║ 🔴 ASK   │  %9.6f │   %6.1f bps   │  %6.1f bps  │  %8.2f %-4s      ║\n" +
+		"║          │    PRICE    │  HALF SPREAD  │  FROM FAIR  │  IN COUNTER ASSET      ║\n" +
+		"║ 🟢 BID   │  %9.6f │   %6.1f bps   │  %6.1f bps  │  %8.6f %-4s      ║\n" +
+		"║ 🔴 ASK   │  %9.6f │   %6.1f bps   │  %6.1f bps  │  %8.6f %-4s      ║\n" +
 		"║ SPREAD   │  %9.6f │   %6.1f bps   │             │                        ║\n" +
 		"╚════════════════════════════════════════════════════════════════════════════════╝",
 		instantPrice, fairPrice, fairPrice,
 		features.BestBid, features.BestAsk, features.ExternalMidPrice,
 		relativeInventory*100, totalWalletBase, s.BotConfig.BaseAsset,
 		rollingVol, volComponentBps,
-		pBid, halfSpreadBidBps, halfSpreadBidBps, halfSpreadBidBaseAsset, s.BotConfig.BaseAsset,
-		pAsk, halfSpreadAskBps, halfSpreadAskBps, halfSpreadAskBaseAsset, s.BotConfig.BaseAsset,
+		pBid, halfSpreadBidBps, halfSpreadBidBps, halfSpreadBid, s.BotConfig.CounterAsset,
+		pAsk, halfSpreadAskBps, halfSpreadAskBps, halfSpreadAsk, s.BotConfig.CounterAsset,
 		spread, spreadBps)
 	
 	if invComponentBid > 0.001 || invComponentAsk > 0.001 || obPenaltyBid > 0.001 || obPenaltyAsk > 0.001 {
