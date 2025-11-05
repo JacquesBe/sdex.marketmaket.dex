@@ -12,6 +12,7 @@ type BotConfig struct {
 	CounterAsset          string                 `bson:"counterAsset"`
 	BaseAssetIssuer       string                 `bson:"baseAssetIssuer"`
 	CounterAssetIssuer    string                 `bson:"counterAssetIssuer"`
+	MinOrderbookAmount    float64                `bson:"minOrderbookAmount"` // Minimum L1 bid/ask amount to include in orderbook
 	PriceFeedOptions      PriceFeedOptions       `bson:"priceFeedOptions"`
 	BalanceMonitorOptions BalanceMonitorOptions  `bson:"balanceMonitorOptions"`
 	StrategyOptions       StrategyOptions        `bson:"strategyOptions"`
@@ -49,6 +50,7 @@ type StrategyOptions struct {
 	VolatilitySensitivity    float64 `bson:"volatilitySensitivity"`    // Volatility sensitivity multiplier
 	InventoryBias            float64 `bson:"inventoryBias"`            // Inventory bias coefficient
 	OBImbalanceSensitivity   float64 `bson:"obImbalanceSensitivity"`   // Order book imbalance sensitivity
+	PriceSmoothing           float64 `bson:"priceSmoothing"`           // EWMA alpha for price smoothing (0-1, higher = faster response)
 }
 
 // OfferManagerOptions contains configuration for the offer manager service

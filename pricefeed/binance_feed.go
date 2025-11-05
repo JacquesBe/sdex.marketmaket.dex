@@ -92,6 +92,8 @@ type FeaturesRow struct {
 	Ts                   int64
 	ExternalMidPrice     float64
 	MicroPrice           float64
+	BestBid              float64
+	BestAsk              float64
 	RollingVolatility    *float64 // nullable if not enough data
 	BidPenalty           float64
 	AskPenalty           float64
@@ -247,6 +249,8 @@ func (fb FeatureBuilder) Build(ob *OrderbookState, featuresBuffer *FeaturesBuffe
 		Ts:                ob.Timestamp,
 		ExternalMidPrice:  externalMidPrice,
 		MicroPrice:        microPrice,
+		BestBid:           ob.BestBid,
+		BestAsk:           ob.BestAsk,
 		RollingVolatility: rollingVolatility,
 		BidPenalty:        bidPenalty,
 		AskPenalty:        askPenalty,

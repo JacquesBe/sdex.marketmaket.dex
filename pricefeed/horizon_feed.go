@@ -219,22 +219,59 @@ func (h *HorizonFeed) buildOrderBookURL() string {
 	return url
 }
 
+// filterSmallL1Orders removes L1 (best bid/ask) if amount is below threshold, keeps rest of book
+// All comparisons are done in base asset terms
+func (h *HorizonFeed) filterSmallL1Orders(bids, asks []OrderBookLevel) ([]OrderBookLevel, []OrderBookLevel) {
+	minAmount := h.config.MinOrderbookAmount
+	if minAmount <= 0 {
+		return bids, asks // No filtering if not configured
+	}
+
+	// Check L1 bid (first entry = best bid)
+	// Bid qty is in counter asset (SHX), convert to base asset (XLM): qty / price
+	if len(bids) > 0 {
+		var bidQty, bidPrice float64
+		if _, err := fmt.Sscanf(bids[0].Quantity, "%f", &bidQty); err == nil {
+			if _, err := fmt.Sscanf(bids[0].Price, "%f", &bidPrice); err == nil && bidPrice > 0 {
+				bidQtyInBase := bidQty / bidPrice // Convert counter asset to base asset
+				if bidQtyInBase < minAmount {
+					log.Printf("[ORDERBOOK FILTER] Removing L1 bid: qty %.4f %s (%.4f base) < min %.4f", 
+						bidQty, h.config.CounterAsset, bidQtyInBase, minAmount)
+					bids = bids[1:] // Remove only first entry, keep rest
+				}
+			}
+		}
+	}
+
+	// Check L1 ask (first entry = best ask)
+	// Ask qty is already in base asset (XLM)
+	if len(asks) > 0 {
+		var askQty float64
+		if _, err := fmt.Sscanf(asks[0].Quantity, "%f", &askQty); err == nil {
+			if askQty < minAmount {
+				log.Printf("[ORDERBOOK FILTER] Removing L1 ask: qty %.4f %s < min %.4f", 
+					askQty, h.config.BaseAsset, minAmount)
+				asks = asks[1:] // Remove only first entry, keep rest
+			}
+		}
+	}
+
+	return bids, asks
+}
+
 // processOrderBookData processes an order book response
 func (h *HorizonFeed) processOrderBookData(orderBook *HorizonOrderBookResponse) {
 
 	// Get current offers from offer monitor to filter them out
 	currentOffers := h.offerMonitor.GetOffers()
 	
-	// DEBUG: Log raw orderbook sizes BEFORE filtering
-	log.Printf("[DEBUG OB] RAW from Horizon: %d bids, %d asks", len(orderBook.Bids), len(orderBook.Asks))
-	
 	// Convert to OrderBookLevels and filter out our own offers
 	// Horizon's convention matches ours: bids=buying XLM, asks=selling XLM
 	bids := h.filterAndConvertLevels(orderBook.Bids, currentOffers, offers.OfferTypeBid)
 	asks := h.filterAndConvertLevels(orderBook.Asks, currentOffers, offers.OfferTypeAsk)
 	
-	// DEBUG: Log after filtering
-	log.Printf("[DEBUG OB] AFTER filtering: %d bids, %d asks", len(bids), len(asks))
+	// Filter out small L1 orders, keeping rest of book
+	bids, asks = h.filterSmallL1Orders(bids, asks)
 
 	// Validate we have data
 	if len(bids) == 0 || len(asks) == 0 {
@@ -246,10 +283,6 @@ func (h *HorizonFeed) processOrderBookData(orderBook *HorizonOrderBookResponse) 
 	utils := OrderbookUtils{}
 	bestBid, bestAsk, bestBidQty, bestAskQty := utils.ComputeBest(bids, asks)
 	depthBidSum, depthAskSum := utils.ComputeDepth(bids, asks, h.config.PriceFeedOptions.BookDepth)
-	
-	// DEBUG: Log computed depth values
-	log.Printf("[DEBUG DEPTH] depthBidSum=%.2f, depthAskSum=%.2f (from %d levels)", 
-		depthBidSum, depthAskSum, h.config.PriceFeedOptions.BookDepth)
 
 	timestamp := time.Now().UnixMilli()
 	obState := &OrderbookState{
@@ -298,20 +331,15 @@ func (h *HorizonFeed) processOrderBookData(orderBook *HorizonOrderBookResponse) 
 	// Calculate mid price for logging
 	midPrice := (bestBid + bestAsk) / 2.0
 
-	// Log every order book update
+	// Log orderbook summary (only every 10th update to reduce noise)
 	h.obLogCounter++
-	if true {
+	if h.obLogCounter%10 == 0 {
 		spread := bestAsk - bestBid
 		spreadBps := (spread / midPrice) * 10000
 		depthImb := (depthBidSum - depthAskSum) / (depthBidSum + depthAskSum)
-		tobImb := (bestBidQty - bestAskQty) / (bestBidQty + bestAskQty)
 
-		log.Printf("\n📊 [ORDER BOOK] Horizon %s/%s", h.config.BaseAsset, h.config.CounterAsset)
-		log.Printf("   Mid: %.6f | Spread: %.6f (%.1f bps)", midPrice, spread, spreadBps)
-		log.Printf("   L1: Bid %.6f@%.0f | Ask %.6f@%.0f", bestBid, bestBidQty, bestAsk, bestAskQty)
-		log.Printf("   Depth(%d): Bids=%.0f Asks=%.0f | TOB: %.3f | Depth: %.3f",
-			h.config.PriceFeedOptions.BookDepth, depthBidSum, depthAskSum, tobImb, depthImb)
-		log.Printf("   Filtered out %d own offers\n", len(currentOffers))
+		log.Printf("📊 [BOOK] Mid %8.4f | Spread %5.1fbps | Depth: Bids %6.1f / Asks %6.1f (Imb %+.2f)",
+			midPrice, spreadBps, depthBidSum, depthAskSum, depthImb)
 	}
 }
 

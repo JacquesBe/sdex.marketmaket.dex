@@ -99,8 +99,7 @@ func (m *Manager) ExecuteOffers() error {
 	// Get latest prices from strategy
 	bidPrice, askPrice, ok := m.strategy.GetLatestPrices()
 	if !ok {
-		log.Printf("[OFFER MANAGER] No prices available from strategy yet, skipping")
-		return nil
+		return nil // Silently skip if no prices yet
 	}
 	// Sanity check prices
 	if bidPrice <= 0 || askPrice <= 0 {
@@ -112,9 +111,6 @@ func (m *Manager) ExecuteOffers() error {
 
 	// Get current offers from monitor
 	currentOffers := m.monitor.GetOffers()
-
-	// Log current state
-	m.logCurrentOffers(currentOffers)
 
 	// Find current bid and ask offers
 	var currentBid, currentAsk *Offer
@@ -132,7 +128,6 @@ func (m *Manager) ExecuteOffers() error {
 	// Evaluate bid
 	bidNeedsUpdate, bidOfferID, bidReason := m.evaluateOffer(currentBid, bidPrice, OfferTypeBid)
 	if bidNeedsUpdate {
-		log.Printf("[OFFER MANAGER] BID needs update: %s", bidReason)
 		offersToSubmit = append(offersToSubmit, OfferToSubmit{
 			OfferID: bidOfferID,
 			Price:   bidPrice,
@@ -143,7 +138,6 @@ func (m *Manager) ExecuteOffers() error {
 	// Evaluate ask
 	askNeedsUpdate, askOfferID, askReason := m.evaluateOffer(currentAsk, askPrice, OfferTypeAsk)
 	if askNeedsUpdate {
-		log.Printf("[OFFER MANAGER] ASK needs update: %s", askReason)
 		offersToSubmit = append(offersToSubmit, OfferToSubmit{
 			OfferID: askOfferID,
 			Price:   askPrice,
@@ -153,8 +147,16 @@ func (m *Manager) ExecuteOffers() error {
 
 	// If nothing to submit, we're done
 	if len(offersToSubmit) == 0 {
-		log.Println("[OFFER MANAGER] All offers OK - no update needed")
-		return nil
+		return nil // Silently skip if no updates needed
+	}
+	
+	// Log what we're updating in structured format
+	if bidNeedsUpdate && askNeedsUpdate {
+		log.Printf("🔄 [UPDATE] 🟢 BID %.6f | 🔴 ASK %.6f", bidPrice, askPrice)
+	} else if bidNeedsUpdate {
+		log.Printf("🔄 [UPDATE] 🟢 BID %.6f (%s)", bidPrice, bidReason)
+	} else {
+		log.Printf("🔄 [UPDATE] 🔴 ASK %.6f (%s)", askPrice, askReason)
 	}
 
 	// Submit all needed offers in one transaction
@@ -273,14 +275,7 @@ func (m *Manager) submitOffers(offers []OfferToSubmit, retryCount int) error {
 		return fmt.Errorf("failed to sign transaction: %w", err)
 	}
 
-	// Log submission
-	if len(offers) == 2 {
-		log.Printf("🚀 [OFFER MANAGER] Submitting BOTH offers in single transaction")
-	} else if offers[0].Type == OfferTypeBid {
-		log.Printf("🟢 [OFFER MANAGER] Submitting BID offer only")
-	} else {
-		log.Printf("🔴 [OFFER MANAGER] Submitting ASK offer only")
-	}
+	// Submission logging removed - already logged in ExecuteOffers
 
 	// Submit transaction
 	resp, err := m.horizonClient.SubmitTransaction(tx)
@@ -306,7 +301,7 @@ func (m *Manager) submitOffers(offers []OfferToSubmit, retryCount int) error {
 		return fmt.Errorf("failed to submit transaction: %w", err)
 	}
 
-	log.Printf("[OFFER MANAGER] ✅ Offers submitted successfully (tx hash: %s)", resp.Hash)
+	log.Printf("✅ [TX] %s", resp.Hash[:8])
 	
 	// Force monitor to refresh immediately to sync hashmap with new on-chain state
 	if err := m.monitor.ForceRefresh(); err != nil {
