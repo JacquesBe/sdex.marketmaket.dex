@@ -96,9 +96,23 @@ func main() {
 		feed = pricefeed.NewBinanceFeed(botConfig)
 		log.Println("Using Binance price feed")
 	} else if priceFeedSource == "kraken" {
-		krakenFeed := pricefeed.NewKrakenFeed(botConfig)
+		// Prompt for direct pair mode
+		directPairMode := promptKrakenDirectPair(
+			botConfig.PriceFeedOptions.BaseAsset,
+			botConfig.PriceFeedOptions.CounterAsset,
+		)
+		krakenFeed := pricefeed.NewKrakenFeed(botConfig, directPairMode)
 		feed = krakenFeed
-		log.Println("Using Kraken price feed with Stellar orderbook monitoring")
+		
+		if directPairMode {
+			log.Printf("Using Kraken DIRECT pair: %s/%s",
+				botConfig.PriceFeedOptions.BaseAsset,
+				botConfig.PriceFeedOptions.CounterAsset)
+		} else {
+			log.Printf("Using Kraken SYNTHETIC pair: %s/USD ÷ %s/USD",
+				botConfig.PriceFeedOptions.BaseAsset,
+				botConfig.PriceFeedOptions.CounterAsset)
+		}
 		
 		// Create Stellar orderbook monitor for OB imbalance
 		stellarOBMonitor = pricefeed.NewStellarOrderbookMonitor(botConfig, horizonBaseURI, offerMonitor)
@@ -313,7 +327,7 @@ func promptPriceFeedSource() string {
 		fmt.Println("Which price feed source would you like to use?")
 		fmt.Println("  1. stellar  - Use Stellar/Horizon order book (native DEX prices)")
 		fmt.Println("  2. binance  - Use Binance CEX order book (external prices)")
-		fmt.Println("  3. kraken   - Use Kraken synthetic pairs (BaseAsset/USD ÷ CounterAsset/USD + Stellar OB)")
+		fmt.Println("  3. kraken   - Use Kraken prices (direct pairs or synthetic via USD + Stellar OB)")
 		fmt.Print("\nEnter your choice (stellar/binance/kraken): ")
 		
 		input, err := reader.ReadString('\n')
@@ -333,6 +347,37 @@ func promptPriceFeedSource() string {
 			return "kraken"
 		} else {
 			fmt.Printf("Invalid choice '%s'. Please enter 'stellar', 'binance', or 'kraken'.\n", choice)
+		}
+	}
+}
+
+// promptKrakenDirectPair prompts user whether to use direct pair or synthetic mode
+func promptKrakenDirectPair(baseAsset, counterAsset string) bool {
+	reader := bufio.NewReader(os.Stdin)
+	
+	for {
+		fmt.Println("\n=== Kraken Pair Mode ===")
+		fmt.Printf("Trading pair: %s/%s\n", baseAsset, counterAsset)
+		fmt.Println("\nDo you want to use a DIRECT pair subscription?")
+		fmt.Printf("  y/yes   - Subscribe to %s/%s directly (if it exists on Kraken)\n", baseAsset, counterAsset)
+		fmt.Printf("  n/no    - Use SYNTHETIC mode: %s/USD ÷ %s/USD\n", baseAsset, counterAsset)
+		fmt.Print("\nDirect pair? (y/n): ")
+		
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			log.Printf("Error reading input: %v", err)
+			continue
+		}
+		
+		// Trim whitespace and convert to lowercase
+		choice := strings.TrimSpace(strings.ToLower(input))
+		
+		if choice == "y" || choice == "yes" {
+			return true
+		} else if choice == "n" || choice == "no" {
+			return false
+		} else {
+			fmt.Printf("Invalid choice '%s'. Please enter 'y' or 'n'.\n", choice)
 		}
 	}
 }

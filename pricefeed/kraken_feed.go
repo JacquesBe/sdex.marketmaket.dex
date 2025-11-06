@@ -22,7 +22,7 @@ type KrakenSubscribeMessage struct {
 // KrakenSpreadMessage represents spread updates from Kraken
 type KrakenSpreadMessage []interface{} // [channelID, [bid, ask, timestamp, bidVolume, askVolume], channelName, pair]
 
-// KrakenFeed manages dual WebSocket connections to Kraken for synthetic pair pricing
+// KrakenFeed manages WebSocket connections to Kraken for both direct and synthetic pair pricing
 type KrakenFeed struct {
 	config              *config.BotConfig
 	baseConn            *websocket.Conn
@@ -36,12 +36,12 @@ type KrakenFeed struct {
 	onDisconnect        DisconnectCallback
 	mu                  sync.RWMutex
 	
-	// Price data for base asset (e.g., XLM/USD)
+	// Price data for base asset (e.g., XLM/USD or XLM/EUR for direct mode)
 	baseBid       float64
 	baseAsk       float64
 	baseUpdatedAt int64
 	
-	// Price data for counter asset (e.g., SHX/USD)
+	// Price data for counter asset (e.g., SHX/USD) - only used for synthetic mode
 	counterBid       float64
 	counterAsk       float64
 	counterUpdatedAt int64
@@ -50,23 +50,58 @@ type KrakenFeed struct {
 	stellarBidPenalty float64
 	stellarAskPenalty float64
 	hasStellarOB      bool
+	
+	// Direct pair mode flag
+	directPairMode bool
 }
 
-// NewKrakenFeed creates a new Kraken price feed for synthetic pairs
-func NewKrakenFeed(botConfig *config.BotConfig) *KrakenFeed {
+// NewKrakenFeed creates a new Kraken price feed for direct or synthetic pairs
+func NewKrakenFeed(botConfig *config.BotConfig, directPairMode bool) *KrakenFeed {
 	return &KrakenFeed{
 		config:         botConfig,
 		reconnect:      true,
 		Features:       NewFeaturesBuffer(botConfig.PriceFeedOptions.BufferLength),
 		FeatureBuilder: NewFeatureBuilder(botConfig.StrategyOptions.VolWindowMs),
+		directPairMode: directPairMode,
 	}
 }
 
-// Start begins the dual WebSocket connections and streams synthetic pair prices
+// Start begins the WebSocket connections and streams prices (direct or synthetic mode)
 func (k *KrakenFeed) Start() error {
-	log.Printf("[KRAKEN] Starting dual price feed: %s/USD and %s/USD", 
-		k.config.BaseAsset, k.config.CounterAsset)
+	if k.directPairMode {
+		log.Printf("[KRAKEN] Starting DIRECT pair feed: %s/%s", 
+			k.config.BaseAsset, k.config.CounterAsset)
+		return k.startDirectMode()
+	}
 	
+	log.Printf("[KRAKEN] Starting SYNTHETIC pair feed: %s/USD and %s/USD", 
+		k.config.BaseAsset, k.config.CounterAsset)
+	return k.startSyntheticMode()
+}
+
+// startDirectMode starts a single WebSocket for direct pair (e.g., XLM/EUR)
+func (k *KrakenFeed) startDirectMode() error {
+	for {
+		k.mu.RLock()
+		shouldReconnect := k.reconnect
+		k.mu.RUnlock()
+		
+		if !shouldReconnect {
+			log.Println("[KRAKEN DIRECT] Stopped")
+			return nil
+		}
+		
+		// Use PriceFeedOptions assets for the direct pair
+		pair := fmt.Sprintf("%s/%s", k.config.PriceFeedOptions.BaseAsset, k.config.PriceFeedOptions.CounterAsset)
+		if err := k.connectAndStreamDirect(pair); err != nil {
+			log.Printf("[KRAKEN DIRECT] Connection error: %v. Reconnecting in 5s...", err)
+			time.Sleep(5 * time.Second)
+		}
+	}
+}
+
+// startSyntheticMode starts dual WebSocket connections for synthetic pairs
+func (k *KrakenFeed) startSyntheticMode() error {
 	var wg sync.WaitGroup
 	
 	// Start base asset feed (e.g., XLM/USD)
@@ -113,6 +148,97 @@ func (k *KrakenFeed) Start() error {
 	
 	wg.Wait()
 	return nil
+}
+
+// connectAndStreamDirect establishes WS connection for a direct trading pair (e.g., XLM/EUR)
+func (k *KrakenFeed) connectAndStreamDirect(pair string) error {
+	// Kraken WS endpoint
+	wsEndpoint := "wss://ws.kraken.com"
+	
+	conn, _, err := websocket.DefaultDialer.Dial(wsEndpoint, nil)
+	if err != nil {
+		return fmt.Errorf("failed to connect to Kraken: %w", err)
+	}
+	defer conn.Close()
+	
+	// Store connection reference
+	k.mu.Lock()
+	k.baseConn = conn
+	k.mu.Unlock()
+	
+	krakenPair := strings.ToUpper(pair)
+	log.Printf("[KRAKEN DIRECT] Connecting to %s...", krakenPair)
+	
+	// Subscribe to spread channel
+	subscribeMsg := KrakenSubscribeMessage{
+		Event: "subscribe",
+		Pair:  []string{krakenPair},
+		Subscription: map[string]interface{}{
+			"name": "spread",
+		},
+	}
+	
+	if err := conn.WriteJSON(subscribeMsg); err != nil {
+		return fmt.Errorf("failed to subscribe: %w", err)
+	}
+	
+	log.Printf("[KRAKEN DIRECT] Subscribed to %s spread", krakenPair)
+	
+	// Read messages loop
+	for {
+		// Check if we should stop
+		k.mu.RLock()
+		shouldContinue := k.reconnect
+		k.mu.RUnlock()
+		
+		if !shouldContinue {
+			return nil // Clean exit
+		}
+		
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("read message failed: %w", err)
+		}
+		
+		k.LastMessageAt = time.Now().UnixMilli()
+		
+		// Try parsing as event message first (subscription confirmation, etc.)
+		var eventMsg map[string]interface{}
+		if err := json.Unmarshal(message, &eventMsg); err == nil {
+			if event, ok := eventMsg["event"].(string); ok {
+				log.Printf("[KRAKEN DIRECT] Event: %s | Full message: %+v", event, eventMsg)
+				if event == "subscriptionStatus" {
+					if status, ok := eventMsg["status"].(string); ok {
+						if status == "subscribed" {
+							log.Printf("[KRAKEN DIRECT] ✅ Successfully subscribed")
+						} else if status == "error" {
+							log.Printf("[KRAKEN DIRECT] ❌ Subscription error: %+v", eventMsg)
+							return fmt.Errorf("subscription failed: %v", eventMsg)
+						}
+					}
+				}
+				continue
+			}
+		}
+		
+		// Try parsing as spread message
+		var spreadMsg []interface{}
+		if err := json.Unmarshal(message, &spreadMsg); err == nil && len(spreadMsg) >= 4 {
+			// Spread message format: [channelID, [bid, ask, timestamp, bidVol, askVol], "spread", "PAIR"]
+			if len(spreadMsg) >= 2 {
+				if spreadData, ok := spreadMsg[1].([]interface{}); ok && len(spreadData) >= 2 {
+					bidStr, _ := spreadData[0].(string)
+					askStr, _ := spreadData[1].(string)
+					
+					var bid, ask float64
+					fmt.Sscanf(bidStr, "%f", &bid)
+					fmt.Sscanf(askStr, "%f", &ask)
+					
+					k.updateDirectPrice(bid, ask)
+				}
+			}
+		}
+	}
 }
 
 // connectAndStream establishes WS connection for a single asset pair
@@ -212,6 +338,19 @@ func (k *KrakenFeed) connectAndStream(asset string, streamType string) error {
 	}
 }
 
+// updateDirectPrice updates price for direct pair and publishes features
+func (k *KrakenFeed) updateDirectPrice(bid, ask float64) {
+	k.mu.Lock()
+	now := time.Now().UnixMilli()
+	k.baseBid = bid
+	k.baseAsk = ask
+	k.baseUpdatedAt = now
+	k.mu.Unlock()
+	
+	// Compute features directly (no synthetic calculation needed)
+	k.computeDirectFeatures(bid, ask)
+}
+
 // updatePrice updates the price for either base or counter asset and triggers synthetic pair computation
 func (k *KrakenFeed) updatePrice(streamType string, bid, ask float64) {
 	k.mu.Lock()
@@ -230,6 +369,71 @@ func (k *KrakenFeed) updatePrice(streamType string, bid, ask float64) {
 	
 	// Compute synthetic pair (XLM/SHX) from XLM/USD and SHX/USD
 	k.computeSyntheticPair()
+}
+
+// computeDirectFeatures builds features from direct pair prices
+func (k *KrakenFeed) computeDirectFeatures(bid, ask float64) {
+	k.mu.RLock()
+	stellarBidPenalty := k.stellarBidPenalty
+	stellarAskPenalty := k.stellarAskPenalty
+	hasStellarOB := k.hasStellarOB
+	k.mu.RUnlock()
+	
+	now := time.Now().UnixMilli()
+	mid := (bid + ask) / 2.0
+	
+	// Estimate quantities (L1) - simplified since we don't have depth from spread channel
+	bidQty := 100.0
+	askQty := 100.0
+	
+	// Build orderbook state
+	obState := &OrderbookState{
+		Timestamp:    now,
+		LastUpdateID: 0,
+		Bids:         []OrderBookLevel{},
+		Asks:         []OrderBookLevel{},
+		BestBid:      bid,
+		BestAsk:      ask,
+		BestBidQty:   bidQty,
+		BestAskQty:   askQty,
+		DepthBidSum:  bidQty,  // L1 only
+		DepthAskSum:  askQty,
+	}
+	k.LastOrderbook = obState
+	
+	// Build features
+	featureRow, ok := k.FeatureBuilder.Build(obState, k.Features)
+	if !ok {
+		return
+	}
+	
+	// Override OB imbalance with Stellar data if available
+	if hasStellarOB {
+		featureRow.BidPenalty = stellarBidPenalty
+		featureRow.AskPenalty = stellarAskPenalty
+	}
+	
+	// Append features
+	k.Features.Append(featureRow)
+	
+	// Log every 50 updates to avoid spam
+	k.Features.mu.RLock()
+	count := k.Features.count
+	k.Features.mu.RUnlock()
+	
+	if count%50 == 0 || count <= 5 {
+		log.Printf("[KRAKEN DIRECT] %s/%s = %.6f | Bid: %.6f | Ask: %.6f | Spread: %.1f bps | Vol: %v | Stellar OB: %v",
+			k.config.PriceFeedOptions.BaseAsset, k.config.PriceFeedOptions.CounterAsset,
+			mid, bid, ask,
+			((ask-bid)/mid)*10000,
+			featureRow.RollingVolatility,
+			hasStellarOB)
+	}
+	
+	// Invoke callback
+	if k.onFeatureUpdate != nil {
+		k.onFeatureUpdate()
+	}
 }
 
 // computeSyntheticPair calculates the synthetic pair price from two USD pairs

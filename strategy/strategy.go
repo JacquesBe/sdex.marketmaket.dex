@@ -152,8 +152,13 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	
 	// 2. Calculate relative inventory: (qBase * ExtMid) / ((qBase * ExtMid) + qQuote) - 0.5
 	// Range: [-0.5, 0.5] where 0 = balanced
+	// ExternalMidPrice = price of base in terms of counter (e.g., EURC per XLM)
+	// baseValue = XLM × (EURC/XLM) = value in EURC
+	// quoteValue = EURC = value in EURC
+	// Both are now in the same units (EURC), so we can compare
 	baseValue := qBase * features.ExternalMidPrice
-	totalValue := baseValue + qQuote
+	quoteValue := qQuote
+	totalValue := baseValue + quoteValue
 	var relativeInventory float64
 	if totalValue > 0 {
 		relativeInventory = (baseValue / totalValue) - 0.5
