@@ -74,18 +74,48 @@ func main() {
 	// Prompt user to select price feed source
 	priceFeedSource := promptPriceFeedSource()
 	log.Printf("Selected price feed source: %s", priceFeedSource)
+	
+	// Prompt for price blending if using external feed
+	var priceBlendWeight float64
+	if priceFeedSource != "stellar" {
+		priceBlendWeight = promptPriceBlendWeight()
+		log.Printf("Price blend: %.0f%% external, %.0f%% Stellar", priceBlendWeight*100, (1-priceBlendWeight)*100)
+	}
 
 	// Initialize offer monitor (needed before Horizon feed)
 	offerMonitor := offers.NewMonitor(botConfig, horizonBaseURI)
 
 	// Initialize the selected price feed
 	var feed pricefeed.PriceFeed
+	var stellarOBMonitor *pricefeed.StellarOrderbookMonitor
+	
 	if priceFeedSource == "stellar" {
 		feed = pricefeed.NewHorizonFeed(botConfig, horizonBaseURI, offerMonitor)
 		log.Println("Using Stellar/Horizon price feed")
-	} else {
+	} else if priceFeedSource == "binance" {
 		feed = pricefeed.NewBinanceFeed(botConfig)
 		log.Println("Using Binance price feed")
+	} else if priceFeedSource == "kraken" {
+		krakenFeed := pricefeed.NewKrakenFeed(botConfig)
+		feed = krakenFeed
+		log.Println("Using Kraken price feed with Stellar orderbook monitoring")
+		
+		// Create Stellar orderbook monitor for OB imbalance
+		stellarOBMonitor = pricefeed.NewStellarOrderbookMonitor(botConfig, horizonBaseURI, offerMonitor)
+		
+		// Wire Stellar OB monitor to Kraken feed
+		stellarOBMonitor.SetUpdateCallback(func(bidPenalty, askPenalty float64) {
+			krakenFeed.SetStellarOrderbookImbalance(bidPenalty, askPenalty)
+		})
+		
+		// Start Stellar OB monitor in background
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := stellarOBMonitor.Start(); err != nil {
+				log.Printf("[STELLAR OB] Error: %v", err)
+			}
+		}()
 	}
 
 	// Run price feed in a goroutine (background service)
@@ -102,6 +132,10 @@ func main() {
 
 	// Initialize strategy engine
 	engine := strategy.NewStrategyEngine(feed, botConfig)
+	if stellarOBMonitor != nil {
+		engine.SetStellarPriceMonitor(stellarOBMonitor)
+		engine.SetExternalPriceBlendWeight(priceBlendWeight)
+	}
 	log.Printf("Strategy engine initialized (volWindow=%dms, blendWeight=%.2f, riskAversion=%.3f)",
 		botConfig.StrategyOptions.VolWindowMs,
 		botConfig.StrategyOptions.BlendWeight,
@@ -182,12 +216,12 @@ func main() {
 		}
 	}()
 
-	// Price feed watchdog - only for Binance (Horizon can have long quiet periods)
-	if priceFeedSource == "binance" {
+	// Price feed watchdog - only for Binance and Kraken (Horizon can have long quiet periods)
+	if priceFeedSource == "binance" || priceFeedSource == "kraken" {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			log.Println("[WATCHDOG] Price feed watchdog started (60s timeout) - Binance only")
+			log.Printf("[WATCHDOG] Price feed watchdog started (60s timeout) - %s", priceFeedSource)
 			ticker := time.NewTicker(10 * time.Second)
 			defer ticker.Stop()
 
@@ -201,7 +235,7 @@ func main() {
 					}
 					elapsed := time.Now().UnixMilli() - lastMsg
 					if elapsed > 60000 { // 60 seconds
-						log.Printf("\n\u274c [WATCHDOG] CRITICAL: Price feed died! Last message %dms ago. Shutting down...", elapsed)
+						log.Printf("\n❌ [WATCHDOG] CRITICAL: Price feed died! Last message %dms ago. Shutting down...", elapsed)
 						// Send shutdown signal
 						syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
 						return
@@ -229,6 +263,11 @@ func main() {
 
 	log.Println("[SHUTDOWN] Stopping offer monitor...")
 	offerMonitor.Stop()
+	
+	if stellarOBMonitor != nil {
+		log.Println("[SHUTDOWN] Stopping Stellar orderbook monitor...")
+		stellarOBMonitor.Stop()
+	}
 
 	// Wait for all goroutines to finish with timeout
 	log.Println("[SHUTDOWN] Waiting for services to stop...")
@@ -277,7 +316,8 @@ func promptPriceFeedSource() string {
 		fmt.Println("Which price feed source would you like to use?")
 		fmt.Println("  1. stellar  - Use Stellar/Horizon order book (native DEX prices)")
 		fmt.Println("  2. binance  - Use Binance CEX order book (external prices)")
-		fmt.Print("\nEnter your choice (stellar/binance): ")
+		fmt.Println("  3. kraken   - Use Kraken synthetic pairs (BaseAsset/USD ÷ CounterAsset/USD + Stellar OB)")
+		fmt.Print("\nEnter your choice (stellar/binance/kraken): ")
 		
 		input, err := reader.ReadString('\n')
 		if err != nil {
@@ -292,8 +332,47 @@ func promptPriceFeedSource() string {
 			return "stellar"
 		} else if choice == "binance" || choice == "2" {
 			return "binance"
+		} else if choice == "kraken" || choice == "3" {
+			return "kraken"
 		} else {
-			fmt.Printf("Invalid choice '%s'. Please enter 'stellar' or 'binance'.\n", choice)
+			fmt.Printf("Invalid choice '%s'. Please enter 'stellar', 'binance', or 'kraken'.\n", choice)
 		}
+	}
+}
+
+// promptPriceBlendWeight prompts the user for external/Stellar price blend weight
+func promptPriceBlendWeight() float64 {
+	reader := bufio.NewReader(os.Stdin)
+	
+	for {
+		fmt.Println("\n=== Price Blending ===")
+		fmt.Println("Blend external price feed with Stellar DEX mid price:")
+		fmt.Println("  0.0 = 100% Stellar (ignore external feed for price)")
+		fmt.Println("  0.5 = 50% external, 50% Stellar")
+		fmt.Println("  1.0 = 100% external (ignore Stellar for price)")
+		fmt.Print("\nEnter blend weight (0.0-1.0): ")
+		
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			log.Printf("Error reading input: %v", err)
+			continue
+		}
+		
+		// Parse float
+		var weight float64
+		input = strings.TrimSpace(input)
+		n, err := fmt.Sscanf(input, "%f", &weight)
+		
+		if err != nil || n != 1 {
+			fmt.Printf("Invalid input '%s'. Please enter a number between 0.0 and 1.0.\n", input)
+			continue
+		}
+		
+		if weight < 0.0 || weight > 1.0 {
+			fmt.Printf("Invalid weight %.2f. Must be between 0.0 and 1.0.\n", weight)
+			continue
+		}
+		
+		return weight
 	}
 }

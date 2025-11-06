@@ -10,6 +10,11 @@ import (
 	"github.com/jacquesbecker/sdex-marketmaker/pricefeed"
 )
 
+// StellarPriceMonitor interface for getting Stellar mid price
+type StellarPriceMonitor interface {
+	GetStellarMidPrice() (midPrice float64, ok bool)
+}
+
 // StrategyEngine manages the market making strategy
 type StrategyEngine struct {
 	Feed           pricefeed.PriceFeed
@@ -20,14 +25,29 @@ type StrategyEngine struct {
 	hasPrices      bool
 	ewmaPrice      float64  // Exponentially weighted moving average price
 	ewmaInitialized bool    // Whether EWMA has been initialized
+	
+	// External price blending (when using non-Stellar feeds)
+	stellarMonitor      StellarPriceMonitor
+	externalBlendWeight float64  // 0.0 = 100% Stellar, 1.0 = 100% external
 }
 
 // NewStrategyEngine creates a new strategy engine with given feed and config
 func NewStrategyEngine(feed pricefeed.PriceFeed, botConfig *config.BotConfig) *StrategyEngine {
 	return &StrategyEngine{
-		Feed:      feed,
-		BotConfig: botConfig,
+		Feed:                feed,
+		BotConfig:           botConfig,
+		externalBlendWeight: 1.0, // Default to 100% external
 	}
+}
+
+// SetStellarPriceMonitor sets the Stellar price monitor for price blending
+func (s *StrategyEngine) SetStellarPriceMonitor(monitor StellarPriceMonitor) {
+	s.stellarMonitor = monitor
+}
+
+// SetExternalPriceBlendWeight sets the blend weight for external vs Stellar prices
+func (s *StrategyEngine) SetExternalPriceBlendWeight(weight float64) {
+	s.externalBlendWeight = weight
 }
 
 // getBalanceMonitor returns the global balance monitor instance
@@ -79,8 +99,28 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	inventoryBias := s.BotConfig.StrategyOptions.InventoryBias
 	orderBookBias := s.BotConfig.StrategyOptions.OBImbalanceSensitivity
 
-	// 1. Calculate instantaneous fair price: (1 - blendWeight) * externalMidPrice + blendWeight * microprice
-	instantPrice := (1-blendWeight)*features.ExternalMidPrice + blendWeight*features.MicroPrice
+	// 1. Calculate instantaneous fair price from external feed
+	// First blend external mid with microprice (L1 weighted)
+	externalFairPrice := (1-blendWeight)*features.ExternalMidPrice + blendWeight*features.MicroPrice
+	
+	// Then optionally blend with Stellar DEX mid price
+	var instantPrice float64
+	if s.stellarMonitor != nil && s.externalBlendWeight < 1.0 {
+		// Blend external with Stellar
+		stellarMid, hasStellar := s.stellarMonitor.GetStellarMidPrice()
+		if hasStellar && stellarMid > 0 {
+			instantPrice = (externalFairPrice * s.externalBlendWeight) + (stellarMid * (1 - s.externalBlendWeight))
+			log.Printf("[PRICE BLEND] External: %.6f | Stellar: %.6f | Blended: %.6f (%.0f%% ext)",
+				externalFairPrice, stellarMid, instantPrice, s.externalBlendWeight*100)
+		} else {
+			// Stellar not available yet, use external only
+			instantPrice = externalFairPrice
+		}
+	} else {
+		// No blending, use external only
+		instantPrice = externalFairPrice
+	}
+	
 	if instantPrice <= 0 {
 		log.Printf("[STRATEGY] Invalid instant price: %.6f", instantPrice)
 		return 0, 0, false
