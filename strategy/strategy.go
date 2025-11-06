@@ -25,6 +25,7 @@ type StrategyEngine struct {
 	hasPrices      bool
 	ewmaPrice      float64  // Exponentially weighted moving average price
 	ewmaInitialized bool    // Whether EWMA has been initialized
+	logCounter     int      // Counter for throttling log output
 	
 	// External price blending (when using non-Stellar feeds)
 	stellarMonitor      StellarPriceMonitor
@@ -110,8 +111,6 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 		stellarMid, hasStellar := s.stellarMonitor.GetStellarMidPrice()
 		if hasStellar && stellarMid > 0 {
 			instantPrice = (externalFairPrice * s.externalBlendWeight) + (stellarMid * (1 - s.externalBlendWeight))
-			log.Printf("[PRICE BLEND] External: %.6f | Stellar: %.6f | Blended: %.6f (%.0f%% ext)",
-				externalFairPrice, stellarMid, instantPrice, s.externalBlendWeight*100)
 		} else {
 			// Stellar not available yet, use external only
 			instantPrice = externalFairPrice
@@ -142,8 +141,14 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	fairPrice := s.ewmaPrice
 	s.mu.Unlock()
 	
-	log.Printf("[PRICE SMOOTHING] Instant: %.6f | EWMA: %.6f | Diff: %.6f (%.2f bps)",
-		instantPrice, fairPrice, instantPrice-fairPrice, ((instantPrice-fairPrice)/fairPrice)*10000)
+	// Increment log counter and only log every 30th execution
+	s.logCounter++
+	shouldLog := (s.logCounter % 30 == 0)
+	
+	if shouldLog {
+		log.Printf("[PRICE SMOOTHING] Instant: %.6f | EWMA: %.6f | Diff: %.6f (%.2f bps)",
+			instantPrice, fairPrice, instantPrice-fairPrice, ((instantPrice-fairPrice)/fairPrice)*10000)
+	}
 	
 	// 2. Calculate relative inventory: (qBase * ExtMid) / ((qBase * ExtMid) + qQuote) - 0.5
 	// Range: [-0.5, 0.5] where 0 = balanced
@@ -195,32 +200,34 @@ func (s *StrategyEngine) ComputeQuotes() (pBid, pAsk float64, ok bool) {
 	halfSpreadAskBps := (halfSpreadAsk / fairPrice) * 10000
 	volComponentBps := (volComponent / fairPrice) * 10000
 	
-	log.Printf("\n" +
-		"╔════════════════════════════════════════════════════════════════════════════════╗\n" +
-		"║ 💰 MARKET MAKING STRATEGY                                                     ║\n" +
-		"╠════════════════════════════════════════════════════════════════════════════════╣\n" +
-		"║ Price    │ Instant: %8.4f │ EWMA: %8.4f │ Final: %8.4f              ║\n" +
-		"║ External │ Bid: %8.4f │ Ask: %8.4f │ Mid: %8.4f                ║\n" +
-		"║ Portfolio│ Inventory: %6.1f%% │ Total Value: %8.2f %-4s                   ║\n" +
-		"║ Volatility│ Rolling: %8.6f │ Impact: %6.1f bps each side             ║\n" +
-		"╠════════════════════════════════════════════════════════════════════════════════╣\n" +
-		"║          │    PRICE    │  HALF SPREAD  │  FROM FAIR  │  IN COUNTER ASSET      ║\n" +
-		"║ 🟢 BID   │  %9.6f │   %6.1f bps   │  %6.1f bps  │  %8.6f %-4s      ║\n" +
-		"║ 🔴 ASK   │  %9.6f │   %6.1f bps   │  %6.1f bps  │  %8.6f %-4s      ║\n" +
-		"║ SPREAD   │  %9.6f │   %6.1f bps   │             │                        ║\n" +
-		"╚════════════════════════════════════════════════════════════════════════════════╝",
-		instantPrice, fairPrice, fairPrice,
-		features.BestBid, features.BestAsk, features.ExternalMidPrice,
-		relativeInventory*100, totalWalletBase, s.BotConfig.BaseAsset,
-		rollingVol, volComponentBps,
-		pBid, halfSpreadBidBps, halfSpreadBidBps, halfSpreadBid, s.BotConfig.CounterAsset,
-		pAsk, halfSpreadAskBps, halfSpreadAskBps, halfSpreadAsk, s.BotConfig.CounterAsset,
-		spread, spreadBps)
-	
-	if invComponentBid > 0.001 || invComponentAsk > 0.001 || obPenaltyBid > 0.001 || obPenaltyAsk > 0.001 {
-		log.Printf("   ⚡ Adjustments: Inv(%.1f/%.1f) OB(%.1f/%.1f) bps",
-			(invComponentBid/fairPrice)*10000, (invComponentAsk/fairPrice)*10000,
-			(obPenaltyBid/fairPrice)*10000, (obPenaltyAsk/fairPrice)*10000)
+	if shouldLog {
+		log.Printf("\n" +
+			"╔════════════════════════════════════════════════════════════════════════════════╗\n" +
+			"║ 💰 MARKET MAKING STRATEGY                                                     ║\n" +
+			"╠════════════════════════════════════════════════════════════════════════════════╣\n" +
+			"║ Price    │ Instant: %8.4f │ EWMA: %8.4f │ Final: %8.4f              ║\n" +
+			"║ External │ Bid: %8.4f │ Ask: %8.4f │ Mid: %8.4f                ║\n" +
+			"║ Portfolio│ Inventory: %6.1f%% │ Total Value: %8.2f %-4s                   ║\n" +
+			"║ Volatility│ Rolling: %8.6f │ Impact: %6.1f bps each side             ║\n" +
+			"╠════════════════════════════════════════════════════════════════════════════════╣\n" +
+			"║          │    PRICE    │  HALF SPREAD  │  FROM FAIR  │  IN COUNTER ASSET      ║\n" +
+			"║ 🟢 BID   │  %9.6f │   %6.1f bps   │  %6.1f bps  │  %8.6f %-4s      ║\n" +
+			"║ 🔴 ASK   │  %9.6f │   %6.1f bps   │  %6.1f bps  │  %8.6f %-4s      ║\n" +
+			"║ SPREAD   │  %9.6f │   %6.1f bps   │             │                        ║\n" +
+			"╚════════════════════════════════════════════════════════════════════════════════╝",
+			instantPrice, fairPrice, fairPrice,
+			features.BestBid, features.BestAsk, features.ExternalMidPrice,
+			relativeInventory*100, totalWalletBase, s.BotConfig.BaseAsset,
+			rollingVol, volComponentBps,
+			pBid, halfSpreadBidBps, halfSpreadBidBps, halfSpreadBid, s.BotConfig.CounterAsset,
+			pAsk, halfSpreadAskBps, halfSpreadAskBps, halfSpreadAsk, s.BotConfig.CounterAsset,
+			spread, spreadBps)
+		
+		if invComponentBid > 0.001 || invComponentAsk > 0.001 || obPenaltyBid > 0.001 || obPenaltyAsk > 0.001 {
+			log.Printf("   ⚡ Adjustments: Inv(%.1f/%.1f) OB(%.1f/%.1f) bps",
+				(invComponentBid/fairPrice)*10000, (invComponentAsk/fairPrice)*10000,
+				(obPenaltyBid/fairPrice)*10000, (obPenaltyAsk/fairPrice)*10000)
+		}
 	}
 
 	// Sanity checks

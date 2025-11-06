@@ -166,11 +166,8 @@ func main() {
 				log.Printf("[PANIC] Strategy callback panicked: %v", r)
 			}
 		}()
-		pBid, pAsk, ok := engine.ComputeQuotes()
-		if ok {
-			log.Printf("💰 [QUOTES] BID: %.6f | ASK: %.6f | Spread: %.6f (%.1fbps)",
-				pBid, pAsk, pAsk-pBid, ((pAsk-pBid)/((pBid+pAsk)/2))*10000)
-		}
+		// Compute quotes silently - detailed logs are in strategy already
+		engine.ComputeQuotes()
 	})
 	
 	// Set disconnect callback: Clear strategy prices when feed dies
